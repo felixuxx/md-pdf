@@ -50,6 +50,12 @@ const BlockquoteInfo = struct {
     content_start: usize,
 };
 
+const TableAlign = enum {
+    left,
+    center,
+    right,
+};
+
 pub fn defaultOutputPath(allocator: std.mem.Allocator, input_path: []const u8) ![]u8 {
     const slash_idx = std.mem.lastIndexOfScalar(u8, input_path, '/');
     const backslash_idx = std.mem.lastIndexOfScalar(u8, input_path, '\\');
@@ -122,6 +128,8 @@ fn renderMarkdownAsPdf(allocator: std.mem.Allocator, markdown: []const u8) ![]u8
     var in_table_block = false;
     var table_rows: std.ArrayList([]const u8) = .empty;
     defer table_rows.deinit(allocator);
+    var table_aligns: std.ArrayList(TableAlign) = .empty;
+    defer table_aligns.deinit(allocator);
 
     var active_list_level: ?usize = null;
     var active_list_text_x: i32 = 0;
@@ -148,18 +156,26 @@ fn renderMarkdownAsPdf(allocator: std.mem.Allocator, markdown: []const u8) ![]u8
                 &has_page,
                 &cursor_y,
                 table_rows.items,
+                table_aligns.items,
                 margin_left,
                 margin_top,
                 margin_bottom,
                 page_height,
             );
             try table_rows.resize(allocator, 0);
+            try table_aligns.resize(allocator, 0);
             in_table_block = false;
         }
 
         if (pending_table_header) |header| {
             if (isTableDelimiterLine(trimmed)) {
                 try table_rows.append(allocator, header);
+                try table_aligns.resize(allocator, 0);
+                var header_cells = try splitTableCells(allocator, header);
+                defer header_cells.deinit(allocator);
+                var aligns = try parseTableAlignments(allocator, trimmed, header_cells.items.len);
+                defer aligns.deinit(allocator);
+                try table_aligns.appendSlice(allocator, aligns.items);
                 in_table_block = true;
                 pending_table_header = null;
                 continue;
@@ -624,6 +640,7 @@ fn renderMarkdownAsPdf(allocator: std.mem.Allocator, markdown: []const u8) ![]u8
             &has_page,
             &cursor_y,
             table_rows.items,
+            table_aligns.items,
             margin_left,
             margin_top,
             margin_bottom,
@@ -841,6 +858,7 @@ fn drawTableBlock(
     has_page: *bool,
     cursor_y: *i32,
     rows: []const []const u8,
+    aligns: []const TableAlign,
     x: i32,
     margin_top: i32,
     margin_bottom: i32,
@@ -875,7 +893,7 @@ fn drawTableBlock(
     cursor_y.* -= 2;
     const line_height: i32 = 14;
 
-    const header_line = try buildTableDisplayLine(allocator, header_cells.items, widths);
+    const header_line = try buildTableDisplayLine(allocator, header_cells.items, widths, aligns);
     try ensureSpace(allocator, page_streams, current_page, has_page, cursor_y, line_height, margin_top, margin_bottom, page_height);
     try drawTextLineWithStyle(allocator, current_page, header_line, x, cursor_y.*, 11, .mono);
     cursor_y.* -= line_height;
@@ -888,7 +906,7 @@ fn drawTableBlock(
     for (rows[1..]) |row| {
         var cells = try splitTableCells(allocator, row);
         defer cells.deinit(allocator);
-        const display = try buildTableDisplayLine(allocator, cells.items, widths);
+        const display = try buildTableDisplayLine(allocator, cells.items, widths, aligns);
         try ensureSpace(allocator, page_streams, current_page, has_page, cursor_y, line_height, margin_top, margin_bottom, page_height);
         try drawTextLineWithStyle(allocator, current_page, display, x, cursor_y.*, 11, .mono);
         cursor_y.* -= line_height;
@@ -897,7 +915,12 @@ fn drawTableBlock(
     cursor_y.* -= 4;
 }
 
-fn buildTableDisplayLine(allocator: std.mem.Allocator, cells: []const []const u8, widths: []const usize) ![]u8 {
+fn buildTableDisplayLine(
+    allocator: std.mem.Allocator,
+    cells: []const []const u8,
+    widths: []const usize,
+    aligns: []const TableAlign,
+) ![]u8 {
     var out: std.ArrayList(u8) = .empty;
     errdefer out.deinit(allocator);
 
@@ -906,9 +929,21 @@ fn buildTableDisplayLine(allocator: std.mem.Allocator, cells: []const []const u8
         try out.append(allocator, ' ');
         const text = if (i < cells.len) cells[i] else "";
         const clipped_len = @min(text.len, w);
+
+        const alignment = if (i < aligns.len) aligns[i] else TableAlign.left;
+        const pad_total = w - clipped_len;
+        const left_pad: usize = switch (alignment) {
+            .left => 0,
+            .right => pad_total,
+            .center => pad_total / 2,
+        };
+        const right_pad = pad_total - left_pad;
+
+        var lp: usize = 0;
+        while (lp < left_pad) : (lp += 1) try out.append(allocator, ' ');
         try out.appendSlice(allocator, text[0..clipped_len]);
-        var pad = clipped_len;
-        while (pad < w) : (pad += 1) try out.append(allocator, ' ');
+        var rp: usize = 0;
+        while (rp < right_pad) : (rp += 1) try out.append(allocator, ' ');
         try out.appendSlice(allocator, " |");
     }
 
@@ -942,6 +977,35 @@ fn splitTableCells(allocator: std.mem.Allocator, line: []const u8) !std.ArrayLis
         try cells.append(allocator, std.mem.trim(u8, part, " \t"));
     }
     return cells;
+}
+
+fn parseTableAlignments(
+    allocator: std.mem.Allocator,
+    delimiter_line: []const u8,
+    col_count: usize,
+) !std.ArrayList(TableAlign) {
+    var aligns: std.ArrayList(TableAlign) = .empty;
+    errdefer aligns.deinit(allocator);
+
+    var cells = try splitTableCells(allocator, delimiter_line);
+    defer cells.deinit(allocator);
+
+    var i: usize = 0;
+    while (i < col_count) : (i += 1) {
+        const cell = if (i < cells.items.len) cells.items[i] else "---";
+        try aligns.append(allocator, tableCellAlign(cell));
+    }
+    return aligns;
+}
+
+fn tableCellAlign(cell: []const u8) TableAlign {
+    const trimmed = std.mem.trim(u8, cell, " \t");
+    if (trimmed.len == 0) return .left;
+    const left = trimmed[0] == ':';
+    const right = trimmed[trimmed.len - 1] == ':';
+    if (left and right) return .center;
+    if (right) return .right;
+    return .left;
 }
 
 fn looksLikeTableRow(line: []const u8) bool {
@@ -2146,6 +2210,17 @@ test "table row split" {
     try std.testing.expectEqualStrings("name", cells.items[0]);
     try std.testing.expectEqualStrings("age", cells.items[1]);
     try std.testing.expectEqualStrings("city", cells.items[2]);
+}
+
+test "table alignment parsing" {
+    const allocator = std.testing.allocator;
+    var aligns = try parseTableAlignments(allocator, "| :--- | :---: | ---: |", 3);
+    defer aligns.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 3), aligns.items.len);
+    try std.testing.expect(aligns.items[0] == .left);
+    try std.testing.expect(aligns.items[1] == .center);
+    try std.testing.expect(aligns.items[2] == .right);
 }
 
 test "zig code tokenization applies highlight kinds" {
