@@ -45,6 +45,11 @@ const ListItemInfo = struct {
     content_start: usize,
 };
 
+const BlockquoteInfo = struct {
+    level: usize,
+    content_start: usize,
+};
+
 pub fn defaultOutputPath(allocator: std.mem.Allocator, input_path: []const u8) ![]u8 {
     const slash_idx = std.mem.lastIndexOfScalar(u8, input_path, '/');
     const backslash_idx = std.mem.lastIndexOfScalar(u8, input_path, '\\');
@@ -234,6 +239,65 @@ fn renderMarkdownAsPdf(allocator: std.mem.Allocator, markdown: []const u8) ![]u8
             try ensureSpace(allocator, &page_streams, &current_page, &has_page, &cursor_y, 16, margin_top, margin_bottom, page_height);
             try drawHorizontalRule(allocator, &current_page, margin_left, 612 - margin_left, cursor_y);
             cursor_y -= 20;
+            continue;
+        }
+
+        if (parseBlockquoteLine(line)) |quote| {
+            active_list_level = null;
+            in_list_block = false;
+            list_loose = false;
+            pending_list_blank = false;
+
+            if (paragraph.items.len > 0) {
+                try drawWrapped(
+                    allocator,
+                    &page_streams,
+                    &current_page,
+                    &has_page,
+                    &cursor_y,
+                    paragraph.items,
+                    margin_left,
+                    12,
+                    16,
+                    80,
+                    margin_top,
+                    margin_bottom,
+                    page_height,
+                );
+                try paragraph.resize(allocator, 0);
+                cursor_y -= 4;
+            }
+
+            const content = std.mem.trimLeft(u8, line[quote.content_start..], " \t");
+            const level_i32: i32 = @intCast(quote.level);
+            const quote_x = margin_left + 14 + level_i32 * 18;
+            const shrink = quote.level * 7;
+            const quote_max: usize = if (80 > shrink + 2) 80 - shrink else 24;
+            const quote_start_y = cursor_y;
+
+            if (content.len == 0) {
+                cursor_y -= 8;
+                continue;
+            }
+
+            try drawWrapped(
+                allocator,
+                &page_streams,
+                &current_page,
+                &has_page,
+                &cursor_y,
+                content,
+                quote_x,
+                12,
+                16,
+                quote_max,
+                margin_top,
+                margin_bottom,
+                page_height,
+            );
+
+            const bar_x = quote_x - 10;
+            try drawVerticalRule(allocator, &current_page, bar_x, quote_start_y + 2, cursor_y + 2);
             continue;
         }
 
@@ -703,6 +767,21 @@ fn parseListItem(line: []const u8) ?ListItemInfo {
         .marker = line[start .. punct + 1],
         .content_start = punct + 2,
     };
+}
+
+fn parseBlockquoteLine(line: []const u8) ?BlockquoteInfo {
+    var i: usize = 0;
+    while (i < line.len and (line[i] == ' ' or line[i] == '\t')) : (i += 1) {}
+    if (i >= line.len or line[i] != '>') return null;
+
+    var level: usize = 0;
+    while (i < line.len and line[i] == '>') {
+        level += 1;
+        i += 1;
+        while (i < line.len and (line[i] == ' ' or line[i] == '\t')) : (i += 1) {}
+    }
+
+    return .{ .level = level, .content_start = i };
 }
 
 fn isListContinuation(line: []const u8, active_level: usize) bool {
@@ -1176,6 +1255,21 @@ fn drawHorizontalRule(
         allocator,
         "q 1 w {d} {d} m {d} {d} l S Q\n",
         .{ x1, y, x2, y },
+    );
+    try page_stream.appendSlice(allocator, command);
+}
+
+fn drawVerticalRule(
+    allocator: std.mem.Allocator,
+    page_stream: *std.ArrayList(u8),
+    x: i32,
+    y_top: i32,
+    y_bottom: i32,
+) !void {
+    const command = try std.fmt.allocPrint(
+        allocator,
+        "q 1 w {d} {d} m {d} {d} l S Q\n",
+        .{ x, y_top, x, y_bottom },
     );
     try page_stream.appendSlice(allocator, command);
 }
@@ -1663,6 +1757,18 @@ test "list continuation detection" {
     try std.testing.expect(isListContinuation("    continuation text", 1));
     try std.testing.expect(!isListContinuation("  too shallow", 1));
     try std.testing.expect(!isListContinuation("    - nested list", 1));
+}
+
+test "parse blockquote line" {
+    const one = parseBlockquoteLine("> quote").?;
+    try std.testing.expectEqual(@as(usize, 1), one.level);
+    try std.testing.expectEqualStrings("quote", std.mem.trimLeft(u8, "> quote"[one.content_start..], " \t"));
+
+    const nested = parseBlockquoteLine("  >> nested quote").?;
+    try std.testing.expectEqual(@as(usize, 2), nested.level);
+    try std.testing.expectEqualStrings("nested quote", std.mem.trimLeft(u8, "  >> nested quote"[nested.content_start..], " \t"));
+
+    try std.testing.expect(parseBlockquoteLine("not quote") == null);
 }
 
 test "zig code tokenization applies highlight kinds" {
