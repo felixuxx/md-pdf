@@ -11,12 +11,25 @@ const TextStyle = enum {
     italic,
     bold_italic,
     mono,
+    link,
 };
 
 const StyledWord = struct {
     text: []u8,
     style: TextStyle,
+    link_dest: ?[]u8,
 };
+
+const LinkAnnotation = struct {
+    x1: i32,
+    y1: i32,
+    x2: i32,
+    y2: i32,
+    url: []const u8,
+};
+
+var g_page_link_annots: ?*std.ArrayList([]LinkAnnotation) = null;
+var g_current_link_annots: ?*std.ArrayList(LinkAnnotation) = null;
 
 const CodeTokenKind = enum {
     normal,
@@ -48,6 +61,11 @@ const ListItemInfo = struct {
 const BlockquoteInfo = struct {
     level: usize,
     content_start: usize,
+};
+
+const ReferenceDefinition = struct {
+    label: []const u8,
+    destination: []const u8,
 };
 
 const TableAlign = enum {
@@ -101,9 +119,19 @@ pub fn convertMarkdownToPdf(
 fn renderMarkdownAsPdf(allocator: std.mem.Allocator, markdown: []const u8) ![]u8 {
     var page_streams: std.ArrayList([]u8) = .empty;
     defer page_streams.deinit(allocator);
+    var page_link_annots: std.ArrayList([]LinkAnnotation) = .empty;
+    defer page_link_annots.deinit(allocator);
 
     var current_page: std.ArrayList(u8) = .empty;
     defer current_page.deinit(allocator);
+    var current_link_annots: std.ArrayList(LinkAnnotation) = .empty;
+    defer current_link_annots.deinit(allocator);
+    g_page_link_annots = &page_link_annots;
+    g_current_link_annots = &current_link_annots;
+    defer {
+        g_page_link_annots = null;
+        g_current_link_annots = null;
+    }
 
     var has_page = false;
     var cursor_y: i32 = 0;
@@ -130,6 +158,9 @@ fn renderMarkdownAsPdf(allocator: std.mem.Allocator, markdown: []const u8) ![]u8
     defer table_rows.deinit(allocator);
     var table_aligns: std.ArrayList(TableAlign) = .empty;
     defer table_aligns.deinit(allocator);
+
+    var reference_defs: std.StringHashMap([]const u8) = .init(allocator);
+    defer reference_defs.deinit();
 
     var active_list_level: ?usize = null;
     var active_list_text_x: i32 = 0;
@@ -186,6 +217,14 @@ fn renderMarkdownAsPdf(allocator: std.mem.Allocator, markdown: []const u8) ![]u8
             }
             try paragraph.appendSlice(allocator, std.mem.trim(u8, header, " \t"));
             pending_table_header = null;
+        }
+
+        if (paragraph.items.len == 0) {
+            if (parseReferenceDefinition(line)) |def| {
+                const norm_label = try normalizeReferenceLabel(allocator, def.label);
+                try reference_defs.put(norm_label, def.destination);
+                continue;
+            }
         }
 
         if (in_indented_code_block) {
@@ -250,12 +289,13 @@ fn renderMarkdownAsPdf(allocator: std.mem.Allocator, markdown: []const u8) ![]u8
             pending_list_blank = false;
             pending_table_header = null;
             if (paragraph.items.len > 0) {
-                try drawWrapped(
+                try drawWrappedWithRefs(
                     allocator,
                     &page_streams,
                     &current_page,
                     &has_page,
                     &cursor_y,
+                    &reference_defs,
                     paragraph.items,
                     margin_left,
                     12,
@@ -299,12 +339,13 @@ fn renderMarkdownAsPdf(allocator: std.mem.Allocator, markdown: []const u8) ![]u8
                 pending_list_blank = false;
             }
             if (paragraph.items.len > 0) {
-                try drawWrapped(
+                try drawWrappedWithRefs(
                     allocator,
                     &page_streams,
                     &current_page,
                     &has_page,
                     &cursor_y,
+                    &reference_defs,
                     paragraph.items,
                     margin_left,
                     12,
@@ -333,12 +374,13 @@ fn renderMarkdownAsPdf(allocator: std.mem.Allocator, markdown: []const u8) ![]u8
                 };
                 const heading_line: i32 = heading_size + 6;
 
-                try drawWrapped(
+                try drawWrappedWithRefs(
                     allocator,
                     &page_streams,
                     &current_page,
                     &has_page,
                     &cursor_y,
+                    &reference_defs,
                     paragraph.items,
                     margin_left,
                     heading_size,
@@ -361,12 +403,13 @@ fn renderMarkdownAsPdf(allocator: std.mem.Allocator, markdown: []const u8) ![]u8
             list_loose = false;
             pending_list_blank = false;
             if (paragraph.items.len > 0) {
-                try drawWrapped(
+                try drawWrappedWithRefs(
                     allocator,
                     &page_streams,
                     &current_page,
                     &has_page,
                     &cursor_y,
+                    &reference_defs,
                     paragraph.items,
                     margin_left,
                     12,
@@ -394,12 +437,13 @@ fn renderMarkdownAsPdf(allocator: std.mem.Allocator, markdown: []const u8) ![]u8
             pending_list_blank = false;
 
             if (paragraph.items.len > 0) {
-                try drawWrapped(
+                try drawWrappedWithRefs(
                     allocator,
                     &page_streams,
                     &current_page,
                     &has_page,
                     &cursor_y,
+                    &reference_defs,
                     paragraph.items,
                     margin_left,
                     12,
@@ -425,12 +469,13 @@ fn renderMarkdownAsPdf(allocator: std.mem.Allocator, markdown: []const u8) ![]u8
                 continue;
             }
 
-            try drawWrapped(
+            try drawWrappedWithRefs(
                 allocator,
                 &page_streams,
                 &current_page,
                 &has_page,
                 &cursor_y,
+                &reference_defs,
                 content,
                 quote_x,
                 12,
@@ -460,12 +505,13 @@ fn renderMarkdownAsPdf(allocator: std.mem.Allocator, markdown: []const u8) ![]u8
             }
 
             if (paragraph.items.len > 0) {
-                try drawWrapped(
+                try drawWrappedWithRefs(
                     allocator,
                     &page_streams,
                     &current_page,
                     &has_page,
                     &cursor_y,
+                    &reference_defs,
                     paragraph.items,
                     margin_left,
                     12,
@@ -486,12 +532,13 @@ fn renderMarkdownAsPdf(allocator: std.mem.Allocator, markdown: []const u8) ![]u8
             const shrink = item.level * 8;
             const item_max: usize = if (80 > shrink + 2) 80 - shrink else 24;
 
-            try drawWrapped(
+            try drawWrappedWithRefs(
                 allocator,
                 &page_streams,
                 &current_page,
                 &has_page,
                 &cursor_y,
+                &reference_defs,
                 list_text,
                 item_x,
                 12,
@@ -513,12 +560,13 @@ fn renderMarkdownAsPdf(allocator: std.mem.Allocator, markdown: []const u8) ![]u8
             if (isListContinuation(line, level)) {
                 pending_table_header = null;
                 if (paragraph.items.len > 0) {
-                    try drawWrapped(
+                    try drawWrappedWithRefs(
                         allocator,
                         &page_streams,
                         &current_page,
                         &has_page,
                         &cursor_y,
+                        &reference_defs,
                         paragraph.items,
                         margin_left,
                         12,
@@ -533,12 +581,13 @@ fn renderMarkdownAsPdf(allocator: std.mem.Allocator, markdown: []const u8) ![]u8
                 }
 
                 const continuation = std.mem.trimLeft(u8, line, " \t");
-                try drawWrapped(
+                try drawWrappedWithRefs(
                     allocator,
                     &page_streams,
                     &current_page,
                     &has_page,
                     &cursor_y,
+                    &reference_defs,
                     continuation,
                     active_list_text_x,
                     12,
@@ -560,12 +609,13 @@ fn renderMarkdownAsPdf(allocator: std.mem.Allocator, markdown: []const u8) ![]u8
         if (trimmed[0] == '#') {
             pending_table_header = null;
             if (paragraph.items.len > 0) {
-                try drawWrapped(
+                try drawWrappedWithRefs(
                     allocator,
                     &page_streams,
                     &current_page,
                     &has_page,
                     &cursor_y,
+                    &reference_defs,
                     paragraph.items,
                     margin_left,
                     12,
@@ -595,12 +645,13 @@ fn renderMarkdownAsPdf(allocator: std.mem.Allocator, markdown: []const u8) ![]u8
             };
             const heading_line: i32 = heading_size + 6;
 
-            try drawWrapped(
+            try drawWrappedWithRefs(
                 allocator,
                 &page_streams,
                 &current_page,
                 &has_page,
                 &cursor_y,
+                &reference_defs,
                 heading_text,
                 margin_left,
                 heading_size,
@@ -681,12 +732,13 @@ fn renderMarkdownAsPdf(allocator: std.mem.Allocator, markdown: []const u8) ![]u8
     }
 
     if (paragraph.items.len > 0) {
-        try drawWrapped(
+        try drawWrappedWithRefs(
             allocator,
             &page_streams,
             &current_page,
             &has_page,
             &cursor_y,
+            &reference_defs,
             paragraph.items,
             margin_left,
             12,
@@ -706,8 +758,10 @@ fn renderMarkdownAsPdf(allocator: std.mem.Allocator, markdown: []const u8) ![]u8
 
     const last_stream = try current_page.toOwnedSlice(allocator);
     try page_streams.append(allocator, last_stream);
+    const last_annots = try current_link_annots.toOwnedSlice(allocator);
+    try page_link_annots.append(allocator, last_annots);
 
-    return try buildPdf(allocator, page_streams.items);
+    return try buildPdf(allocator, page_streams.items, page_link_annots.items);
 }
 
 fn drawWrapped(
@@ -761,6 +815,207 @@ fn drawWrapped(
     }
 }
 
+fn drawWrappedWithRefs(
+    allocator: std.mem.Allocator,
+    page_streams: *std.ArrayList([]u8),
+    current_page: *std.ArrayList(u8),
+    has_page: *bool,
+    cursor_y: *i32,
+    refs: *const std.StringHashMap([]const u8),
+    text: []const u8,
+    x: i32,
+    font_size: i32,
+    line_height: i32,
+    max_chars: usize,
+    margin_top: i32,
+    margin_bottom: i32,
+    page_height: i32,
+) !void {
+    const resolved = try resolveReferenceLinks(allocator, text, refs);
+    try drawWrapped(
+        allocator,
+        page_streams,
+        current_page,
+        has_page,
+        cursor_y,
+        resolved,
+        x,
+        font_size,
+        line_height,
+        max_chars,
+        margin_top,
+        margin_bottom,
+        page_height,
+    );
+}
+
+fn resolveReferenceLinks(
+    allocator: std.mem.Allocator,
+    text: []const u8,
+    refs: *const std.StringHashMap([]const u8),
+) ![]const u8 {
+    if (std.mem.indexOfScalar(u8, text, '[') == null and std.mem.indexOfScalar(u8, text, '<') == null) return text;
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    var i: usize = 0;
+    while (i < text.len) {
+        if (text[i] == '<') {
+            const close_angle = std.mem.indexOfScalarPos(u8, text, i + 1, '>') orelse {
+                try out.append(allocator, text[i]);
+                i += 1;
+                continue;
+            };
+
+            const target = text[i + 1 .. close_angle];
+            if (isLikelyAutolinkTarget(target)) {
+                try out.appendSlice(allocator, target);
+                try out.appendSlice(allocator, " (");
+                try out.appendSlice(allocator, target);
+                try out.append(allocator, ')');
+                i = close_angle + 1;
+                continue;
+            }
+
+            try out.appendSlice(allocator, text[i .. close_angle + 1]);
+            i = close_angle + 1;
+            continue;
+        }
+
+        if (text[i] != '[') {
+            try out.append(allocator, text[i]);
+            i += 1;
+            continue;
+        }
+
+        const close_first = std.mem.indexOfScalarPos(u8, text, i + 1, ']') orelse {
+            try out.append(allocator, text[i]);
+            i += 1;
+            continue;
+        };
+
+        const display = text[i + 1 .. close_first];
+        const next_idx = close_first + 1;
+
+        if (next_idx < text.len and text[next_idx] == '(') {
+            const close_paren = std.mem.indexOfScalarPos(u8, text, next_idx + 1, ')') orelse {
+                try out.appendSlice(allocator, text[i .. close_first + 1]);
+                i = close_first + 1;
+                continue;
+            };
+
+            const destination = std.mem.trim(u8, text[next_idx + 1 .. close_paren], " \t");
+            if (destination.len > 0) {
+                if (embeddedLinkLabel(display)) |name| {
+                    try out.appendSlice(allocator, name);
+                    try out.appendSlice(allocator, "<<@");
+                    try out.appendSlice(allocator, destination);
+                    try out.appendSlice(allocator, "@>>");
+                } else {
+                    try out.appendSlice(allocator, display);
+                    try out.appendSlice(allocator, " (");
+                    try out.appendSlice(allocator, destination);
+                    try out.append(allocator, ')');
+                }
+                i = close_paren + 1;
+                continue;
+            }
+
+            try out.appendSlice(allocator, text[i .. close_paren + 1]);
+            i = close_paren + 1;
+            continue;
+        }
+
+        if (next_idx < text.len and text[next_idx] == '[') {
+            const close_second = std.mem.indexOfScalarPos(u8, text, next_idx + 1, ']') orelse {
+                try out.appendSlice(allocator, text[i .. close_first + 1]);
+                i = close_first + 1;
+                continue;
+            };
+
+            const explicit_label = text[next_idx + 1 .. close_second];
+            const label = if (explicit_label.len == 0) display else explicit_label;
+            if (lookupReferenceDestination(refs, label)) |dest| {
+                if (embeddedLinkLabel(display)) |name| {
+                    try out.appendSlice(allocator, name);
+                    try out.appendSlice(allocator, "<<@");
+                    try out.appendSlice(allocator, dest);
+                    try out.appendSlice(allocator, "@>>");
+                } else {
+                    try out.appendSlice(allocator, display);
+                    try out.appendSlice(allocator, " (");
+                    try out.appendSlice(allocator, dest);
+                    try out.append(allocator, ')');
+                }
+                i = close_second + 1;
+                continue;
+            }
+
+            try out.appendSlice(allocator, text[i .. close_second + 1]);
+            i = close_second + 1;
+            continue;
+        }
+
+        if (lookupReferenceDestination(refs, display)) |dest| {
+            if (embeddedLinkLabel(display)) |name| {
+                try out.appendSlice(allocator, name);
+                try out.appendSlice(allocator, "<<@");
+                try out.appendSlice(allocator, dest);
+                try out.appendSlice(allocator, "@>>");
+            } else {
+                try out.appendSlice(allocator, display);
+                try out.appendSlice(allocator, " (");
+                try out.appendSlice(allocator, dest);
+                try out.append(allocator, ')');
+            }
+            i = close_first + 1;
+            continue;
+        }
+
+        try out.appendSlice(allocator, text[i .. close_first + 1]);
+        i = close_first + 1;
+    }
+
+    return out.toOwnedSlice(allocator);
+}
+
+fn isLikelyAutolinkTarget(target: []const u8) bool {
+    return std.mem.startsWith(u8, target, "http://") or
+        std.mem.startsWith(u8, target, "https://") or
+        std.mem.startsWith(u8, target, "mailto:");
+}
+
+fn embeddedLinkLabel(display: []const u8) ?[]const u8 {
+    if (display.len < 2) return null;
+    if (display[0] != '!') return null;
+    const name = std.mem.trim(u8, display[1..], " \t");
+    if (name.len == 0) return null;
+    return name;
+}
+
+fn lookupReferenceDestination(
+    refs: *const std.StringHashMap([]const u8),
+    label: []const u8,
+) ?[]const u8 {
+    var it = refs.iterator();
+    while (it.next()) |entry| {
+        if (referenceLabelEqualsStored(entry.key_ptr.*, label)) {
+            return entry.value_ptr.*;
+        }
+    }
+    return null;
+}
+
+fn referenceLabelEqualsStored(stored_normalized: []const u8, raw_label: []const u8) bool {
+    const trimmed = std.mem.trim(u8, raw_label, " \t");
+    if (stored_normalized.len != trimmed.len) return false;
+    for (trimmed, 0..) |c, idx| {
+        if (stored_normalized[idx] != std.ascii.toLower(c)) return false;
+    }
+    return true;
+}
+
 fn ensureSpace(
     allocator: std.mem.Allocator,
     page_streams: *std.ArrayList([]u8),
@@ -781,6 +1036,13 @@ fn ensureSpace(
     if (cursor_y.* - line_height < margin_bottom) {
         const done = try current_page.toOwnedSlice(allocator);
         try page_streams.append(allocator, done);
+        if (g_page_link_annots) |all_annots| {
+            if (g_current_link_annots) |cur_annots| {
+                const page_annots = try cur_annots.toOwnedSlice(allocator);
+                try all_annots.append(allocator, page_annots);
+                cur_annots.* = .empty;
+            }
+        }
         current_page.* = .empty;
         cursor_y.* = page_height - margin_top;
     }
@@ -1174,6 +1436,44 @@ fn parseSetextUnderline(trimmed_line: []const u8) ?u8 {
 
     if (count == 0) return null;
     return if (marker.? == '=') 1 else 2;
+}
+
+fn parseReferenceDefinition(line: []const u8) ?ReferenceDefinition {
+    var i: usize = 0;
+    var leading_spaces: usize = 0;
+    while (i < line.len and line[i] == ' ' and leading_spaces < 4) : (i += 1) leading_spaces += 1;
+    if (i < line.len and line[i] == '\t') return null;
+    if (i >= line.len or line[i] != '[') return null;
+
+    const label_start = i + 1;
+    const label_end = std.mem.indexOfScalarPos(u8, line, label_start, ']') orelse return null;
+    if (label_end == label_start) return null;
+
+    i = label_end + 1;
+    if (i >= line.len or line[i] != ':') return null;
+    i += 1;
+
+    while (i < line.len and (line[i] == ' ' or line[i] == '\t')) : (i += 1) {}
+    if (i >= line.len) return null;
+
+    const dest_start = i;
+    while (i < line.len and line[i] != ' ' and line[i] != '\t') : (i += 1) {}
+    const destination = line[dest_start..i];
+    if (destination.len == 0) return null;
+
+    return .{
+        .label = line[label_start..label_end],
+        .destination = destination,
+    };
+}
+
+fn normalizeReferenceLabel(allocator: std.mem.Allocator, label: []const u8) ![]u8 {
+    const trimmed = std.mem.trim(u8, label, " \t");
+    const out = try allocator.alloc(u8, trimmed.len);
+    for (trimmed, 0..) |c, idx| {
+        out[idx] = std.ascii.toLower(c);
+    }
+    return out;
 }
 
 fn isListContinuation(line: []const u8, active_level: usize) bool {
@@ -1712,6 +2012,9 @@ fn drawStyledLine(
     const header = try std.fmt.allocPrint(allocator, "BT 1 0 0 1 {d} {d} Tm\n", .{ x, y });
     try command.appendSlice(allocator, header);
 
+    var pen_x = x;
+    const char_w: i32 = @max(1, @divTrunc(font_size * 6, 10));
+
     var current_style: ?TextStyle = null;
     for (words, 0..) |word, idx| {
         if (idx != 0) {
@@ -1722,9 +2025,11 @@ fn drawStyledLine(
                     .{ fontNameForStyle(word.style), font_size },
                 );
                 try command.appendSlice(allocator, set_font);
+                try command.appendSlice(allocator, textColorCommandForStyle(word.style));
                 current_style = word.style;
             }
             try command.appendSlice(allocator, "( ) Tj\n");
+            pen_x += char_w;
         }
 
         if (current_style == null or current_style.? != word.style) {
@@ -1734,12 +2039,29 @@ fn drawStyledLine(
                 .{ fontNameForStyle(word.style), font_size },
             );
             try command.appendSlice(allocator, set_font);
+            try command.appendSlice(allocator, textColorCommandForStyle(word.style));
             current_style = word.style;
         }
 
         const escaped = try escapePdfText(allocator, word.text);
         const text_cmd = try std.fmt.allocPrint(allocator, "({s}) Tj\n", .{escaped});
         try command.appendSlice(allocator, text_cmd);
+
+        const word_w: i32 = @intCast(word.text.len);
+        if (word.link_dest) |dest| {
+            if (g_current_link_annots) |cur_annots| {
+                const url_copy = try allocator.alloc(u8, dest.len);
+                std.mem.copyForwards(u8, url_copy, dest);
+                try cur_annots.append(allocator, .{
+                    .x1 = pen_x,
+                    .y1 = y - font_size,
+                    .x2 = pen_x + word_w * char_w,
+                    .y2 = y + 2,
+                    .url = url_copy,
+                });
+            }
+        }
+        pen_x += word_w * char_w;
     }
 
     try command.appendSlice(allocator, "ET\n");
@@ -1753,6 +2075,14 @@ fn fontNameForStyle(style: TextStyle) []const u8 {
         .italic => "/F3",
         .bold_italic => "/F4",
         .mono => "/F5",
+        .link => "/F1",
+    };
+}
+
+fn textColorCommandForStyle(style: TextStyle) []const u8 {
+    return switch (style) {
+        .link => "0.06 0.20 0.72 rg\n",
+        else => "0 0 0 rg\n",
     };
 }
 
@@ -1764,7 +2094,10 @@ fn styleFromFlags(bold: bool, italic: bool) TextStyle {
 }
 
 fn deinitStyledWords(allocator: std.mem.Allocator, words: *std.ArrayList(StyledWord)) void {
-    for (words.items) |word| allocator.free(word.text);
+    for (words.items) |word| {
+        allocator.free(word.text);
+        if (word.link_dest) |dest| allocator.free(dest);
+    }
     words.deinit(allocator);
 }
 
@@ -1861,9 +2194,80 @@ fn appendStyledWord(
     text: []const u8,
     style: TextStyle,
 ) !void {
-    const copy = try allocator.alloc(u8, text.len);
-    @memcpy(copy, text);
-    try out.append(allocator, .{ .text = copy, .style = style });
+    var link_dest: ?[]u8 = null;
+    var copy: []u8 = undefined;
+
+    if (extractEmbeddedLinkMarker(text)) |m| {
+        const url = text[m.url_start..m.url_end];
+        const url_copy = try allocator.alloc(u8, url.len);
+        std.mem.copyForwards(u8, url_copy, url);
+        link_dest = url_copy;
+
+        const left = text[0..m.marker_start];
+        const right = text[m.marker_end..];
+        copy = try allocator.alloc(u8, left.len + right.len);
+        std.mem.copyForwards(u8, copy[0..left.len], left);
+        std.mem.copyForwards(u8, copy[left.len..], right);
+    } else {
+        copy = try allocator.alloc(u8, text.len);
+        std.mem.copyForwards(u8, copy, text);
+    }
+
+    const final_style: TextStyle = if (link_dest != null) .link else styleForWord(style, copy);
+    try out.append(allocator, .{ .text = copy, .style = final_style, .link_dest = link_dest });
+}
+
+fn extractEmbeddedLinkMarker(text: []const u8) ?struct {
+    marker_start: usize,
+    marker_end: usize,
+    url_start: usize,
+    url_end: usize,
+} {
+    const marker_start = std.mem.lastIndexOf(u8, text, "<<@") orelse return null;
+    const marker_end_incl = std.mem.indexOfPos(u8, text, marker_start + 3, "@>>") orelse return null;
+    const url_start = marker_start + 3;
+    const url_end = marker_end_incl;
+    if (marker_start == 0 or url_end <= url_start) return null;
+    return .{
+        .marker_start = marker_start,
+        .marker_end = marker_end_incl + 3,
+        .url_start = url_start,
+        .url_end = url_end,
+    };
+}
+
+fn styleForWord(base: TextStyle, text: []const u8) TextStyle {
+    if (base != .regular) return base;
+    return if (isUrlLikeWord(text) or isBracketDisplayLinkWord(text)) .link else base;
+}
+
+fn isUrlLikeWord(word: []const u8) bool {
+    var start: usize = 0;
+    var end: usize = word.len;
+
+    while (start < end and (word[start] == '(' or word[start] == '<' or word[start] == '[')) : (start += 1) {}
+    while (end > start and (word[end - 1] == ')' or word[end - 1] == '>' or word[end - 1] == ']' or word[end - 1] == '.' or word[end - 1] == ',')) : (end -= 1) {}
+
+    if (end <= start) return false;
+    const core = word[start..end];
+    return isLikelyAutolinkTarget(core);
+}
+
+fn isBracketDisplayLinkWord(word: []const u8) bool {
+    var start: usize = 0;
+    var end: usize = word.len;
+
+    while (start < end and (word[start] == '(' or word[start] == '<')) : (start += 1) {}
+    while (end > start and (word[end - 1] == ')' or word[end - 1] == '>' or word[end - 1] == '.' or word[end - 1] == ',')) : (end -= 1) {}
+    if (end <= start + 2) return false;
+
+    const core = word[start..end];
+    if (core[0] != '[' or core[core.len - 1] != ']') return false;
+    const inner = std.mem.trim(u8, core[1 .. core.len - 1], " \t");
+    if (inner.len == 0) return false;
+    if (std.mem.indexOfScalar(u8, inner, '[') != null) return false;
+    if (std.mem.indexOfScalar(u8, inner, ']') != null) return false;
+    return true;
 }
 
 fn canToggleMarker(text: []const u8, marker_idx: usize, marker_len: usize) bool {
@@ -1896,7 +2300,11 @@ fn escapePdfText(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
     return out.toOwnedSlice(allocator);
 }
 
-fn buildPdf(allocator: std.mem.Allocator, page_streams: []const []const u8) ![]u8 {
+fn buildPdf(
+    allocator: std.mem.Allocator,
+    page_streams: []const []const u8,
+    page_link_annots: []const []LinkAnnotation,
+) ![]u8 {
     var objects: std.ArrayList([]const u8) = .empty;
     defer objects.deinit(allocator);
 
@@ -1920,13 +2328,51 @@ fn buildPdf(allocator: std.mem.Allocator, page_streams: []const []const u8) ![]u
         try content_ids.append(allocator, objects.items.len);
     }
 
+    var page_annots_refs: std.ArrayList(?[]const u8) = .empty;
+    defer page_annots_refs.deinit(allocator);
+    var page_idx: usize = 0;
+    while (page_idx < page_streams.len) : (page_idx += 1) {
+        const annots = if (page_idx < page_link_annots.len) page_link_annots[page_idx] else &.{};
+        if (annots.len == 0) {
+            try page_annots_refs.append(allocator, null);
+            continue;
+        }
+
+        var ids: std.ArrayList(usize) = .empty;
+        defer ids.deinit(allocator);
+        for (annots) |a| {
+            const escaped_url = try escapePdfText(allocator, a.url);
+            const annot_obj = try std.fmt.allocPrint(
+                allocator,
+                "<< /Type /Annot /Subtype /Link /Rect [{d} {d} {d} {d}] /Border [0 0 0] /A << /S /URI /URI ({s}) >> >>",
+                .{ a.x1, a.y1, a.x2, a.y2, escaped_url },
+            );
+            try objects.append(allocator, annot_obj);
+            try ids.append(allocator, objects.items.len);
+        }
+
+        var refs: std.ArrayList(u8) = .empty;
+        defer refs.deinit(allocator);
+        try refs.append(allocator, '[');
+        for (ids.items) |id| {
+            const item = try std.fmt.allocPrint(allocator, "{d} 0 R ", .{id});
+            try refs.appendSlice(allocator, item);
+        }
+        try refs.append(allocator, ']');
+        try page_annots_refs.append(allocator, try refs.toOwnedSlice(allocator));
+    }
+
     var page_ids: std.ArrayList(usize) = .empty;
     defer page_ids.deinit(allocator);
-    for (content_ids.items) |content_id| {
+    for (content_ids.items, 0..) |content_id, idx| {
+        const annots_part = if (idx < page_annots_refs.items.len and page_annots_refs.items[idx] != null)
+            try std.fmt.allocPrint(allocator, " /Annots {s}", .{page_annots_refs.items[idx].?})
+        else
+            "";
         const page_obj = try std.fmt.allocPrint(
             allocator,
-            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R /F2 4 0 R /F3 5 0 R /F4 6 0 R /F5 7 0 R >> >> /Contents {d} 0 R >>",
-            .{content_id},
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R /F2 4 0 R /F3 5 0 R /F4 6 0 R /F5 7 0 R >> >> /Contents {d} 0 R{s} >>",
+            .{ content_id, annots_part },
         );
         try objects.append(allocator, page_obj);
         try page_ids.append(allocator, objects.items.len);
@@ -2221,6 +2667,86 @@ test "table alignment parsing" {
     try std.testing.expect(aligns.items[0] == .left);
     try std.testing.expect(aligns.items[1] == .center);
     try std.testing.expect(aligns.items[2] == .right);
+}
+
+test "reference definition parsing" {
+    const def = parseReferenceDefinition("[docs]: https://example.com/docs \"title\"").?;
+    try std.testing.expectEqualStrings("docs", def.label);
+    try std.testing.expectEqualStrings("https://example.com/docs", def.destination);
+    try std.testing.expect(parseReferenceDefinition("not a ref") == null);
+}
+
+test "reference label normalization" {
+    const allocator = std.testing.allocator;
+    const norm = try normalizeReferenceLabel(allocator, "  MyLabel\t");
+    defer allocator.free(norm);
+    try std.testing.expectEqualStrings("mylabel", norm);
+}
+
+test "reference link resolution" {
+    const allocator = std.testing.allocator;
+    var refs = std.StringHashMap([]const u8).init(allocator);
+
+    const label = try normalizeReferenceLabel(allocator, "Docs");
+    defer allocator.free(label);
+    defer refs.deinit();
+    try refs.put(label, "https://example.com/docs");
+
+    const resolved = try resolveReferenceLinks(allocator, "See [API][Docs] and [Docs].", &refs);
+    defer if (resolved.ptr != "See [API][Docs] and [Docs].".ptr) allocator.free(resolved);
+    try std.testing.expectEqualStrings("See API (https://example.com/docs) and Docs (https://example.com/docs).", resolved);
+}
+
+test "inline link and autolink resolution" {
+    const allocator = std.testing.allocator;
+    var refs = std.StringHashMap([]const u8).init(allocator);
+    defer refs.deinit();
+
+    const input = "Read [guide](https://example.com/guide) and <https://example.com/api>.";
+    const resolved = try resolveReferenceLinks(allocator, input, &refs);
+    defer if (resolved.ptr != input.ptr) allocator.free(resolved);
+    try std.testing.expectEqualStrings(
+        "Read guide (https://example.com/guide) and https://example.com/api (https://example.com/api).",
+        resolved,
+    );
+}
+
+test "embedded display link syntax" {
+    const allocator = std.testing.allocator;
+    var refs = std.StringHashMap([]const u8).init(allocator);
+    defer refs.deinit();
+
+    const label = try normalizeReferenceLabel(allocator, "docs");
+    defer allocator.free(label);
+    try refs.put(label, "https://example.com/docs");
+
+    const input = "Use [!Guide](https://example.com/guide) and [!Docs][docs].";
+    const resolved = try resolveReferenceLinks(allocator, input, &refs);
+    defer if (resolved.ptr != input.ptr) allocator.free(resolved);
+    try std.testing.expectEqualStrings(
+        "Use Guide<<@https://example.com/guide@>> and Docs<<@https://example.com/docs@>>.",
+        resolved,
+    );
+}
+
+test "url words are styled as links" {
+    const allocator = std.testing.allocator;
+    var words = try inlineStyledWords(allocator, "see https://example.com and (mailto:a@b.com)");
+    defer deinitStyledWords(allocator, &words);
+
+    try std.testing.expect(words.items.len >= 3);
+    try std.testing.expect(words.items[1].style == .link);
+    try std.testing.expect(words.items[3].style == .link);
+}
+
+test "bracket display links are styled as links" {
+    const allocator = std.testing.allocator;
+    var words = try inlineStyledWords(allocator, "See [Guide]. and [Docs]");
+    defer deinitStyledWords(allocator, &words);
+
+    try std.testing.expect(words.items.len >= 3);
+    try std.testing.expect(words.items[1].style == .link);
+    try std.testing.expect(words.items[3].style == .link);
 }
 
 test "zig code tokenization applies highlight kinds" {
