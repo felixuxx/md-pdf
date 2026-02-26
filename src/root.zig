@@ -112,6 +112,9 @@ fn renderMarkdownAsPdf(allocator: std.mem.Allocator, markdown: []const u8) ![]u8
     var active_list_level: ?usize = null;
     var active_list_text_x: i32 = 0;
     var active_list_max: usize = 0;
+    var in_list_block = false;
+    var list_loose = false;
+    var pending_list_blank = false;
 
     var it = std.mem.splitScalar(u8, markdown, '\n');
     while (it.next()) |line_raw| {
@@ -145,6 +148,9 @@ fn renderMarkdownAsPdf(allocator: std.mem.Allocator, markdown: []const u8) ![]u8
 
         if (std.mem.startsWith(u8, trimmed, "```")) {
             active_list_level = null;
+            in_list_block = false;
+            list_loose = false;
+            pending_list_blank = false;
             if (paragraph.items.len > 0) {
                 try drawWrapped(
                     allocator,
@@ -170,7 +176,14 @@ fn renderMarkdownAsPdf(allocator: std.mem.Allocator, markdown: []const u8) ![]u8
         }
 
         if (trimmed.len == 0) {
-            active_list_level = null;
+            if (in_list_block) {
+                pending_list_blank = true;
+                active_list_level = null;
+            } else {
+                active_list_level = null;
+                list_loose = false;
+                pending_list_blank = false;
+            }
             if (paragraph.items.len > 0) {
                 try drawWrapped(
                     allocator,
@@ -195,6 +208,9 @@ fn renderMarkdownAsPdf(allocator: std.mem.Allocator, markdown: []const u8) ![]u8
 
         if (isThematicBreak(trimmed)) {
             active_list_level = null;
+            in_list_block = false;
+            list_loose = false;
+            pending_list_blank = false;
             if (paragraph.items.len > 0) {
                 try drawWrapped(
                     allocator,
@@ -222,6 +238,17 @@ fn renderMarkdownAsPdf(allocator: std.mem.Allocator, markdown: []const u8) ![]u8
         }
 
         if (parseListItem(line)) |item| {
+            if (!in_list_block) {
+                in_list_block = true;
+                list_loose = false;
+            }
+
+            if (pending_list_blank) {
+                list_loose = true;
+                cursor_y -= 4;
+                pending_list_blank = false;
+            }
+
             if (paragraph.items.len > 0) {
                 try drawWrapped(
                     allocator,
@@ -268,6 +295,7 @@ fn renderMarkdownAsPdf(allocator: std.mem.Allocator, markdown: []const u8) ![]u8
             active_list_level = item.level;
             active_list_text_x = item_x + 20;
             active_list_max = if (item_max > 4) item_max - 4 else item_max;
+            if (list_loose) cursor_y -= 2;
             continue;
         }
 
@@ -314,6 +342,9 @@ fn renderMarkdownAsPdf(allocator: std.mem.Allocator, markdown: []const u8) ![]u8
         }
 
         active_list_level = null;
+        in_list_block = false;
+        list_loose = false;
+        pending_list_blank = false;
 
         if (trimmed[0] == '#') {
             if (paragraph.items.len > 0) {
