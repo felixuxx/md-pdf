@@ -22,6 +22,7 @@ const CodeTokenKind = enum {
     normal,
     keyword,
     command,
+    option,
     string,
     number,
     comment,
@@ -30,6 +31,18 @@ const CodeTokenKind = enum {
 const CodeToken = struct {
     text: []const u8,
     kind: CodeTokenKind,
+};
+
+const ListKind = enum {
+    unordered,
+    ordered,
+};
+
+const ListItemInfo = struct {
+    kind: ListKind,
+    level: usize,
+    marker: []const u8,
+    content_start: usize,
 };
 
 pub fn defaultOutputPath(allocator: std.mem.Allocator, input_path: []const u8) ![]u8 {
@@ -198,6 +211,52 @@ fn renderMarkdownAsPdf(allocator: std.mem.Allocator, markdown: []const u8) ![]u8
             try ensureSpace(allocator, &page_streams, &current_page, &has_page, &cursor_y, 16, margin_top, margin_bottom, page_height);
             try drawHorizontalRule(allocator, &current_page, margin_left, 612 - margin_left, cursor_y);
             cursor_y -= 20;
+            continue;
+        }
+
+        if (parseListItem(line)) |item| {
+            if (paragraph.items.len > 0) {
+                try drawWrapped(
+                    allocator,
+                    &page_streams,
+                    &current_page,
+                    &has_page,
+                    &cursor_y,
+                    paragraph.items,
+                    margin_left,
+                    12,
+                    16,
+                    80,
+                    margin_top,
+                    margin_bottom,
+                    page_height,
+                );
+                try paragraph.resize(allocator, 0);
+                cursor_y -= 4;
+            }
+
+            const body = std.mem.trimLeft(u8, line[item.content_start..], " \t");
+            const list_text = try std.fmt.allocPrint(allocator, "{s} {s}", .{ item.marker, body });
+            const level_i32: i32 = @intCast(item.level);
+            const item_x = margin_left + level_i32 * 24;
+            const shrink = item.level * 8;
+            const item_max: usize = if (80 > shrink + 2) 80 - shrink else 24;
+
+            try drawWrapped(
+                allocator,
+                &page_streams,
+                &current_page,
+                &has_page,
+                &cursor_y,
+                list_text,
+                item_x,
+                12,
+                16,
+                item_max,
+                margin_top,
+                margin_bottom,
+                page_height,
+            );
             continue;
         }
 
@@ -529,6 +588,7 @@ fn colorCommandForCodeToken(kind: CodeTokenKind) []const u8 {
         .normal => "0 0 0 rg\n",
         .keyword => "0.09 0.21 0.58 rg\n",
         .command => "0.42 0.08 0.50 rg\n",
+        .option => "0.55 0.32 0.03 rg\n",
         .string => "0.62 0.16 0.15 rg\n",
         .number => "0.10 0.45 0.48 rg\n",
         .comment => "0.20 0.43 0.17 rg\n",
@@ -549,6 +609,55 @@ fn parseFenceLanguage(trimmed_line: []const u8) ?[]const u8 {
     }
     if (end == 0) return null;
     return rest[0..end];
+}
+
+fn parseListItem(line: []const u8) ?ListItemInfo {
+    var i: usize = 0;
+    var indent_cols: usize = 0;
+    while (i < line.len) {
+        if (line[i] == ' ') {
+            indent_cols += 1;
+            i += 1;
+            continue;
+        }
+        if (line[i] == '\t') {
+            indent_cols += 4;
+            i += 1;
+            continue;
+        }
+        break;
+    }
+
+    if (i >= line.len) return null;
+    const level = indent_cols / 2;
+
+    if (line[i] == '-' or line[i] == '*' or line[i] == '+') {
+        if (i + 1 < line.len and (line[i + 1] == ' ' or line[i + 1] == '\t')) {
+            return .{
+                .kind = .unordered,
+                .level = level,
+                .marker = line[i .. i + 1],
+                .content_start = i + 2,
+            };
+        }
+        return null;
+    }
+
+    if (!std.ascii.isDigit(line[i])) return null;
+    const start = i;
+    while (i < line.len and std.ascii.isDigit(line[i])) : (i += 1) {}
+    if (i >= line.len) return null;
+    if (line[i] != '.' and line[i] != ')') return null;
+    const punct = i;
+    if (punct + 1 >= line.len) return null;
+    if (line[punct + 1] != ' ' and line[punct + 1] != '\t') return null;
+
+    return .{
+        .kind = .ordered,
+        .level = level,
+        .marker = line[start .. punct + 1],
+        .content_start = punct + 2,
+    };
 }
 
 fn tokenizeCodeLine(
@@ -766,6 +875,15 @@ fn tokenizeBashCodeLine(allocator: std.mem.Allocator, line: []const u8) !std.Arr
             continue;
         }
 
+        if (line[i] == '-' and isBashOptionStart(line, i)) {
+            const start = i;
+            i += 1;
+            while (i < line.len and isBashOptionChar(line[i])) : (i += 1) {}
+            try out.append(allocator, .{ .text = line[start..i], .kind = .option });
+            expecting_command = false;
+            continue;
+        }
+
         if (std.ascii.isDigit(line[i])) {
             const start = i;
             i += 1;
@@ -913,6 +1031,19 @@ fn isBashTokenBoundary(line: []const u8, idx: usize) bool {
     if (c == '#' and (idx == 0 or std.ascii.isWhitespace(line[idx - 1]))) return true;
     if (isBashIdentStart(c) or std.ascii.isDigit(c)) return true;
     return false;
+}
+
+fn isBashOptionStart(line: []const u8, idx: usize) bool {
+    if (line[idx] != '-') return false;
+    if (idx + 1 >= line.len) return false;
+    if (line[idx + 1] == '-' and idx + 2 < line.len) {
+        return std.ascii.isAlphabetic(line[idx + 2]);
+    }
+    return std.ascii.isAlphabetic(line[idx + 1]);
+}
+
+fn isBashOptionChar(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '-' or c == '_';
 }
 
 fn isJsonKeyword(word: []const u8) bool {
@@ -1434,6 +1565,28 @@ test "parse fenced code language" {
     try std.testing.expect(parseFenceLanguage("```") == null);
 }
 
+test "parse unordered list item with nesting" {
+    const item = parseListItem("    - child item").?;
+    try std.testing.expect(item.kind == .unordered);
+    try std.testing.expectEqual(@as(usize, 2), item.level);
+    try std.testing.expectEqualStrings("-", item.marker);
+    try std.testing.expectEqualStrings("child item", std.mem.trimLeft(u8, "    - child item"[item.content_start..], " \t"));
+}
+
+test "parse ordered list item" {
+    const item = parseListItem("  12. step").?;
+    try std.testing.expect(item.kind == .ordered);
+    try std.testing.expectEqual(@as(usize, 1), item.level);
+    try std.testing.expectEqualStrings("12.", item.marker);
+    try std.testing.expectEqualStrings("step", std.mem.trimLeft(u8, "  12. step"[item.content_start..], " \t"));
+}
+
+test "non list lines are ignored" {
+    try std.testing.expect(parseListItem("abc- not list") == null);
+    try std.testing.expect(parseListItem("-not list") == null);
+    try std.testing.expect(parseListItem("1.not list") == null);
+}
+
 test "zig code tokenization applies highlight kinds" {
     const allocator = std.testing.allocator;
     var tokens = try tokenizeCodeLine(allocator, "const n = 42 // note", "zig");
@@ -1532,4 +1685,23 @@ test "bash backticks are highlighted" {
     }
     try std.testing.expect(found_echo);
     try std.testing.expect(found_tick);
+}
+
+test "bash options are highlighted" {
+    const allocator = std.testing.allocator;
+    var tokens = try tokenizeCodeLine(allocator, "grep -n --color=always foo", "bash");
+    defer tokens.deinit(allocator);
+
+    var found_cmd = false;
+    var found_short = false;
+    var found_long = false;
+    for (tokens.items) |tok| {
+        if (std.mem.eql(u8, tok.text, "grep") and tok.kind == .command) found_cmd = true;
+        if (std.mem.eql(u8, tok.text, "-n") and tok.kind == .option) found_short = true;
+        if (std.mem.eql(u8, tok.text, "--color") and tok.kind == .option) found_long = true;
+    }
+
+    try std.testing.expect(found_cmd);
+    try std.testing.expect(found_short);
+    try std.testing.expect(found_long);
 }
