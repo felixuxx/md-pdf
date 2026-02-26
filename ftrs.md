@@ -1,0 +1,35 @@
+#
+
+- Block-level markdown:
+  - Setext headings (Title + ---)
+  - Ordered lists (1. item)
+  - Nested lists / indentation-aware blocks
+  - Blockquotes (>)
+  - Fenced/indented code blocks
+  - Tables
+  - HTML blocks
+  - Reference definitions
+- Inline markdown:
+  - Links [text](url)
+  - Images ![alt](src)
+  - Inline code  `code`
+  - Strikethrough ~~text~~
+  - Autolinks <https://...>
+  - Proper entity handling (&amp;, etc.)
+- Layout/typography:
+  - Real font metrics (current wrap is char-count based)
+  - Text alignment options
+  - Paragraph first-line indent / spacing controls
+  - Widow/orphan control
+  - Hyphenation
+- PDF capabilities:
+  - Clickable link annotations
+  - Embedded fonts (currently built-in Helvetica family only)
+  - Metadata (title/author/subject)
+  - Page numbers / headers / footers
+  - TOC/bookmarks
+- Compatibility/robustness:
+  - Full CommonMark delimiter rules
+  - UTF-8 shaping/complex scripts
+  - Better error reporting with source line numbers
+  
