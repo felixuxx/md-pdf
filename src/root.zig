@@ -18,6 +18,19 @@ const StyledWord = struct {
     style: TextStyle,
 };
 
+const CodeTokenKind = enum {
+    normal,
+    keyword,
+    string,
+    number,
+    comment,
+};
+
+const CodeToken = struct {
+    text: []const u8,
+    kind: CodeTokenKind,
+};
+
 pub fn defaultOutputPath(allocator: std.mem.Allocator, input_path: []const u8) ![]u8 {
     const slash_idx = std.mem.lastIndexOfScalar(u8, input_path, '/');
     const backslash_idx = std.mem.lastIndexOfScalar(u8, input_path, '\\');
@@ -80,6 +93,7 @@ fn renderMarkdownAsPdf(allocator: std.mem.Allocator, markdown: []const u8) ![]u8
     var in_code_block = false;
     var code_block: std.ArrayList(u8) = .empty;
     defer code_block.deinit(allocator);
+    var code_lang: ?[]const u8 = null;
 
     var it = std.mem.splitScalar(u8, markdown, '\n');
     while (it.next()) |line_raw| {
@@ -95,6 +109,7 @@ fn renderMarkdownAsPdf(allocator: std.mem.Allocator, markdown: []const u8) ![]u8
                     &has_page,
                     &cursor_y,
                     code_block.items,
+                    code_lang,
                     margin_left,
                     margin_top,
                     margin_bottom,
@@ -102,6 +117,7 @@ fn renderMarkdownAsPdf(allocator: std.mem.Allocator, markdown: []const u8) ![]u8
                 );
                 try code_block.resize(allocator, 0);
                 in_code_block = false;
+                code_lang = null;
             } else {
                 try code_block.appendSlice(allocator, line);
                 try code_block.append(allocator, '\n');
@@ -130,6 +146,7 @@ fn renderMarkdownAsPdf(allocator: std.mem.Allocator, markdown: []const u8) ![]u8
                 cursor_y -= 4;
             }
             in_code_block = true;
+            code_lang = parseFenceLanguage(trimmed);
             continue;
         }
 
@@ -294,6 +311,7 @@ fn renderMarkdownAsPdf(allocator: std.mem.Allocator, markdown: []const u8) ![]u8
             &has_page,
             &cursor_y,
             code_block.items,
+            code_lang,
             margin_left,
             margin_top,
             margin_bottom,
@@ -443,6 +461,7 @@ fn drawCodeBlock(
     has_page: *bool,
     cursor_y: *i32,
     code: []const u8,
+    language: ?[]const u8,
     x: i32,
     margin_top: i32,
     margin_bottom: i32,
@@ -459,16 +478,171 @@ fn drawCodeBlock(
         var line = raw_line;
         while (line.len > max_chars) {
             try ensureSpace(allocator, page_streams, current_page, has_page, cursor_y, line_height, margin_top, margin_bottom, page_height);
-            try drawTextLineWithStyle(allocator, current_page, line[0..max_chars], x, cursor_y.*, font_size, .mono);
+            try drawCodeLineWithHighlight(allocator, current_page, line[0..max_chars], language, x, cursor_y.*, font_size);
             cursor_y.* -= line_height;
             line = line[max_chars..];
         }
 
         try ensureSpace(allocator, page_streams, current_page, has_page, cursor_y, line_height, margin_top, margin_bottom, page_height);
-        try drawTextLineWithStyle(allocator, current_page, line, x, cursor_y.*, font_size, .mono);
+        try drawCodeLineWithHighlight(allocator, current_page, line, language, x, cursor_y.*, font_size);
         cursor_y.* -= line_height;
     }
     cursor_y.* -= 6;
+}
+
+fn drawCodeLineWithHighlight(
+    allocator: std.mem.Allocator,
+    page_stream: *std.ArrayList(u8),
+    line: []const u8,
+    language: ?[]const u8,
+    x: i32,
+    y: i32,
+    font_size: i32,
+) !void {
+    var tokens = try tokenizeCodeLine(allocator, line, language);
+    defer tokens.deinit(allocator);
+
+    var command: std.ArrayList(u8) = .empty;
+    defer command.deinit(allocator);
+
+    const header = try std.fmt.allocPrint(allocator, "BT /F5 {d} Tf 1 0 0 1 {d} {d} Tm\n", .{ font_size, x, y });
+    try command.appendSlice(allocator, header);
+
+    var current_kind: ?CodeTokenKind = null;
+    for (tokens.items) |token| {
+        if (current_kind == null or current_kind.? != token.kind) {
+            try command.appendSlice(allocator, colorCommandForCodeToken(token.kind));
+            current_kind = token.kind;
+        }
+        const escaped = try escapePdfText(allocator, token.text);
+        const text_cmd = try std.fmt.allocPrint(allocator, "({s}) Tj\n", .{escaped});
+        try command.appendSlice(allocator, text_cmd);
+    }
+
+    try command.appendSlice(allocator, "ET\n");
+    try page_stream.appendSlice(allocator, command.items);
+}
+
+fn colorCommandForCodeToken(kind: CodeTokenKind) []const u8 {
+    return switch (kind) {
+        .normal => "0 0 0 rg\n",
+        .keyword => "0.09 0.21 0.58 rg\n",
+        .string => "0.62 0.16 0.15 rg\n",
+        .number => "0.10 0.45 0.48 rg\n",
+        .comment => "0.20 0.43 0.17 rg\n",
+    };
+}
+
+fn parseFenceLanguage(trimmed_line: []const u8) ?[]const u8 {
+    if (!std.mem.startsWith(u8, trimmed_line, "```")) return null;
+    const rest = std.mem.trimLeft(u8, trimmed_line[3..], " \t");
+    if (rest.len == 0) return null;
+
+    var end = rest.len;
+    for (rest, 0..) |c, i| {
+        if (c == ' ' or c == '\t') {
+            end = i;
+            break;
+        }
+    }
+    if (end == 0) return null;
+    return rest[0..end];
+}
+
+fn tokenizeCodeLine(
+    allocator: std.mem.Allocator,
+    line: []const u8,
+    language: ?[]const u8,
+) !std.ArrayList(CodeToken) {
+    var out: std.ArrayList(CodeToken) = .empty;
+    errdefer out.deinit(allocator);
+
+    if (language == null or !std.ascii.eqlIgnoreCase(language.?, "zig")) {
+        try out.append(allocator, .{ .text = line, .kind = .normal });
+        return out;
+    }
+
+    var i: usize = 0;
+    while (i < line.len) {
+        if (i + 1 < line.len and line[i] == '/' and line[i + 1] == '/') {
+            try out.append(allocator, .{ .text = line[i..], .kind = .comment });
+            break;
+        }
+
+        if (line[i] == '"') {
+            var j = i + 1;
+            while (j < line.len) : (j += 1) {
+                if (line[j] == '\\' and j + 1 < line.len) {
+                    j += 1;
+                    continue;
+                }
+                if (line[j] == '"') {
+                    j += 1;
+                    break;
+                }
+            }
+            try out.append(allocator, .{ .text = line[i..@min(j, line.len)], .kind = .string });
+            i = @min(j, line.len);
+            continue;
+        }
+
+        if (std.ascii.isDigit(line[i])) {
+            var j = i + 1;
+            while (j < line.len and isCodeNumberChar(line[j])) : (j += 1) {}
+            try out.append(allocator, .{ .text = line[i..j], .kind = .number });
+            i = j;
+            continue;
+        }
+
+        if (isIdentStart(line[i])) {
+            var j = i + 1;
+            while (j < line.len and isIdentContinue(line[j])) : (j += 1) {}
+            const ident = line[i..j];
+            try out.append(allocator, .{ .text = ident, .kind = if (isZigKeyword(ident)) .keyword else .normal });
+            i = j;
+            continue;
+        }
+
+        var j = i + 1;
+        while (j < line.len and !isTokenBoundary(line, j)) : (j += 1) {}
+        try out.append(allocator, .{ .text = line[i..j], .kind = .normal });
+        i = j;
+    }
+
+    return out;
+}
+
+fn isCodeNumberChar(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '_' or c == '.';
+}
+
+fn isIdentStart(c: u8) bool {
+    return std.ascii.isAlphabetic(c) or c == '_';
+}
+
+fn isIdentContinue(c: u8) bool {
+    return isIdentStart(c) or std.ascii.isDigit(c);
+}
+
+fn isTokenBoundary(line: []const u8, idx: usize) bool {
+    const c = line[idx];
+    if (std.ascii.isWhitespace(c)) return true;
+    if (c == '"') return true;
+    if (idx + 1 < line.len and c == '/' and line[idx + 1] == '/') return true;
+    if (isIdentStart(c) or std.ascii.isDigit(c)) return true;
+    return false;
+}
+
+fn isZigKeyword(word: []const u8) bool {
+    const keywords = [_][]const u8{
+        "const",   "var",      "fn",    "pub",      "if",     "else", "while", "for",    "switch",   "return", "try", "catch",
+        "defer",   "errdefer", "break", "continue", "struct", "enum", "union", "opaque", "comptime", "inline", "asm", "nosuspend",
+        "suspend", "resume",   "await", "true",     "false",  "null", "or",    "and",
+    };
+    for (keywords) |k| {
+        if (std.mem.eql(u8, k, word)) return true;
+    }
+    return false;
 }
 
 fn drawHorizontalRule(
@@ -935,4 +1109,29 @@ test "thematic break detection" {
     try std.testing.expect(!isThematicBreak("--"));
     try std.testing.expect(!isThematicBreak("-_ -"));
     try std.testing.expect(!isThematicBreak("text"));
+}
+
+test "parse fenced code language" {
+    try std.testing.expectEqualStrings("zig", parseFenceLanguage("```zig").?);
+    try std.testing.expectEqualStrings("rust", parseFenceLanguage("``` rust").?);
+    try std.testing.expect(parseFenceLanguage("```") == null);
+}
+
+test "zig code tokenization applies highlight kinds" {
+    const allocator = std.testing.allocator;
+    var tokens = try tokenizeCodeLine(allocator, "const n = 42 // note", "zig");
+    defer tokens.deinit(allocator);
+
+    try std.testing.expect(tokens.items.len >= 5);
+    try std.testing.expectEqualStrings("const", tokens.items[0].text);
+    try std.testing.expect(tokens.items[0].kind == .keyword);
+
+    var found_number = false;
+    var found_comment = false;
+    for (tokens.items) |tok| {
+        if (std.mem.eql(u8, tok.text, "42") and tok.kind == .number) found_number = true;
+        if (std.mem.eql(u8, tok.text, "// note") and tok.kind == .comment) found_comment = true;
+    }
+    try std.testing.expect(found_number);
+    try std.testing.expect(found_comment);
 }
