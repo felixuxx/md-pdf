@@ -211,6 +211,39 @@ fn renderMarkdownAsPdf(allocator: std.mem.Allocator, markdown: []const u8) ![]u8
             continue;
         }
 
+        if (!in_list_block and paragraph.items.len > 0) {
+            if (parseSetextUnderline(trimmed)) |setext_level| {
+                const heading_size: i32 = switch (setext_level) {
+                    1 => 24,
+                    else => 18,
+                };
+                const heading_max: usize = switch (heading_size) {
+                    24 => 40,
+                    else => 55,
+                };
+                const heading_line: i32 = heading_size + 6;
+
+                try drawWrapped(
+                    allocator,
+                    &page_streams,
+                    &current_page,
+                    &has_page,
+                    &cursor_y,
+                    paragraph.items,
+                    margin_left,
+                    heading_size,
+                    heading_line,
+                    heading_max,
+                    margin_top,
+                    margin_bottom,
+                    page_height,
+                );
+                try paragraph.resize(allocator, 0);
+                cursor_y -= 6;
+                continue;
+            }
+        }
+
         if (isThematicBreak(trimmed)) {
             active_list_level = null;
             in_list_block = false;
@@ -782,6 +815,23 @@ fn parseBlockquoteLine(line: []const u8) ?BlockquoteInfo {
     }
 
     return .{ .level = level, .content_start = i };
+}
+
+fn parseSetextUnderline(trimmed_line: []const u8) ?u8 {
+    if (trimmed_line.len == 0) return null;
+
+    var marker: ?u8 = null;
+    var count: usize = 0;
+    for (trimmed_line) |c| {
+        if (c == ' ' or c == '\t') continue;
+        if (c != '=' and c != '-') return null;
+        if (marker == null) marker = c;
+        if (marker.? != c) return null;
+        count += 1;
+    }
+
+    if (count == 0) return null;
+    return if (marker.? == '=') 1 else 2;
 }
 
 fn isListContinuation(line: []const u8, active_level: usize) bool {
@@ -1769,6 +1819,14 @@ test "parse blockquote line" {
     try std.testing.expectEqualStrings("nested quote", std.mem.trimLeft(u8, "  >> nested quote"[nested.content_start..], " \t"));
 
     try std.testing.expect(parseBlockquoteLine("not quote") == null);
+}
+
+test "parse setext underline" {
+    try std.testing.expectEqual(@as(?u8, 1), parseSetextUnderline("====="));
+    try std.testing.expectEqual(@as(?u8, 2), parseSetextUnderline("---"));
+    try std.testing.expectEqual(@as(?u8, 2), parseSetextUnderline(" - - - "));
+    try std.testing.expect(parseSetextUnderline("--=") == null);
+    try std.testing.expect(parseSetextUnderline("text") == null);
 }
 
 test "zig code tokenization applies highlight kinds" {

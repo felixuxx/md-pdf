@@ -2,6 +2,6 @@ test.md
 test.pdf
 readme.pdf
 ftrs.pdf
-
+ci.yml
 .zig-cache/
 zig-out/
