@@ -1,35 +1,35 @@
-#
+# Feature Status
 
 - Block-level markdown:
-  - Setext headings (Title + ---)
-  - Ordered lists (1. item)
-  - Nested lists / indentation-aware blocks
-  - Blockquotes (>)
-  - Fenced/indented code blocks
-  - Tables
-  - HTML blocks
-  - Reference definitions
+  - [x] Setext headings (Title + ---)
+  - [x] Ordered lists (1. item)
+  - [x] Nested lists / indentation-aware blocks (basic)
+  - [x] Blockquotes (>)
+  - [x] Fenced/indented code blocks
+  - [x] Tables (basic pipe tables)
+  - [ ] HTML blocks
+  - [x] Reference definitions
 - Inline markdown:
-  - Links [text](url)
-  - Images ![alt](src)
-  - Inline code  `code`
-  - Strikethrough ~~text~~
-  - Autolinks <https://...>
-  - Proper entity handling (&amp;, etc.)
+  - [x] Links [text](url)
+  - [ ] Images ![alt](src) (general image rendering)
+  - [x] Inline code `code`
+  - [ ] Strikethrough ~~text~~
+  - [x] Autolinks <https://...>
+  - [ ] Proper entity handling (&amp;, etc.)
 - Layout/typography:
-  - Real font metrics (current wrap is char-count based)
-  - Text alignment options
-  - Paragraph first-line indent / spacing controls
-  - Widow/orphan control
-  - Hyphenation
+  - [ ] Real font metrics (still approximate width)
+  - [ ] Text alignment options (except table alignment)
+  - [ ] Paragraph first-line indent / spacing controls
+  - [ ] Widow/orphan control
+  - [ ] Hyphenation
 - PDF capabilities:
-  - Clickable link annotations
-  - Embedded fonts (currently built-in Helvetica family only)
-  - Metadata (title/author/subject)
-  - Page numbers / headers / footers
-  - TOC/bookmarks
+  - [x] Clickable link annotations
+  - [ ] Embedded fonts (currently built-in Helvetica/Courier only)
+  - [ ] Metadata (title/author/subject)
+  - [ ] Page numbers / headers / footers
+  - [ ] TOC/bookmarks
 - Compatibility/robustness:
-  - Full CommonMark delimiter rules
-  - UTF-8 shaping/complex scripts
-  - Better error reporting with source line numbers
+  - [ ] Full CommonMark delimiter rules
+  - [ ] UTF-8 shaping/complex scripts
+  - [ ] Better error reporting with source line numbers
   

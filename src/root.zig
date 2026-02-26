@@ -12,12 +12,14 @@ const TextStyle = enum {
     bold_italic,
     mono,
     link,
+    badge,
 };
 
 const StyledWord = struct {
     text: []u8,
     style: TextStyle,
     link_dest: ?[]u8,
+    badge_color: ?[3]f32,
 };
 
 const LinkAnnotation = struct {
@@ -861,6 +863,19 @@ fn resolveReferenceLinks(
 
     var i: usize = 0;
     while (i < text.len) {
+        if (parseInlineBadgeLinkAt(text, i)) |badge| {
+            try appendBadgeDisplayText(allocator, &out, badge.display, badge.image_url);
+            try out.appendSlice(allocator, "<<@");
+            try out.appendSlice(allocator, badge.href);
+            if (badge.color_name) |cn| {
+                try out.appendSlice(allocator, "|c=");
+                try out.appendSlice(allocator, cn);
+            }
+            try out.appendSlice(allocator, "@>>");
+            i = badge.end_idx;
+            continue;
+        }
+
         if (text[i] == '<') {
             const close_angle = std.mem.indexOfScalarPos(u8, text, i + 1, '>') orelse {
                 try out.append(allocator, text[i]);
@@ -871,9 +886,9 @@ fn resolveReferenceLinks(
             const target = text[i + 1 .. close_angle];
             if (isLikelyAutolinkTarget(target)) {
                 try out.appendSlice(allocator, target);
-                try out.appendSlice(allocator, " (");
+                try out.appendSlice(allocator, "<<@");
                 try out.appendSlice(allocator, target);
-                try out.append(allocator, ')');
+                try out.appendSlice(allocator, "@>>");
                 i = close_angle + 1;
                 continue;
             }
@@ -914,9 +929,9 @@ fn resolveReferenceLinks(
                     try out.appendSlice(allocator, "@>>");
                 } else {
                     try out.appendSlice(allocator, display);
-                    try out.appendSlice(allocator, " (");
+                    try out.appendSlice(allocator, "<<@");
                     try out.appendSlice(allocator, destination);
-                    try out.append(allocator, ')');
+                    try out.appendSlice(allocator, "@>>");
                 }
                 i = close_paren + 1;
                 continue;
@@ -944,9 +959,9 @@ fn resolveReferenceLinks(
                     try out.appendSlice(allocator, "@>>");
                 } else {
                     try out.appendSlice(allocator, display);
-                    try out.appendSlice(allocator, " (");
+                    try out.appendSlice(allocator, "<<@");
                     try out.appendSlice(allocator, dest);
-                    try out.append(allocator, ')');
+                    try out.appendSlice(allocator, "@>>");
                 }
                 i = close_second + 1;
                 continue;
@@ -965,9 +980,9 @@ fn resolveReferenceLinks(
                 try out.appendSlice(allocator, "@>>");
             } else {
                 try out.appendSlice(allocator, display);
-                try out.appendSlice(allocator, " (");
+                try out.appendSlice(allocator, "<<@");
                 try out.appendSlice(allocator, dest);
-                try out.append(allocator, ')');
+                try out.appendSlice(allocator, "@>>");
             }
             i = close_first + 1;
             continue;
@@ -984,6 +999,120 @@ fn isLikelyAutolinkTarget(target: []const u8) bool {
     return std.mem.startsWith(u8, target, "http://") or
         std.mem.startsWith(u8, target, "https://") or
         std.mem.startsWith(u8, target, "mailto:");
+}
+
+fn parseInlineBadgeLinkAt(text: []const u8, start: usize) ?struct {
+    display: []const u8,
+    image_url: []const u8,
+    href: []const u8,
+    color_name: ?[]const u8,
+    end_idx: usize,
+} {
+    if (start + 5 >= text.len) return null;
+    if (!std.mem.startsWith(u8, text[start..], "[![")) return null;
+
+    const alt_start = start + 3;
+    const alt_close_rel = std.mem.indexOfPos(u8, text, alt_start, "](") orelse return null;
+    const img_start = alt_close_rel + 2;
+    const img_end = std.mem.indexOfScalarPos(u8, text, img_start, ')') orelse return null;
+    if (img_end + 2 >= text.len) return null;
+    if (text[img_end + 1] != ']' or text[img_end + 2] != '(') return null;
+    const href_start = img_end + 3;
+    const href_end = std.mem.indexOfScalarPos(u8, text, href_start, ')') orelse return null;
+
+    const alt = text[alt_start..alt_close_rel];
+    const img = text[img_start..img_end];
+    const href = text[href_start..href_end];
+    if (alt.len == 0 or href.len == 0) return null;
+
+    const color_name = parseShieldsColorName(img);
+    return .{ .display = alt, .image_url = img, .href = href, .color_name = color_name, .end_idx = href_end + 1 };
+}
+
+fn appendBadgeDisplayText(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    fallback: []const u8,
+    image_url: []const u8,
+) !void {
+    if (parseShieldsLabelMessage(image_url)) |parts| {
+        try appendDecodedShieldsComponent(allocator, out, parts.label);
+        if (parts.message) |msg| {
+            if (msg.len > 0) {
+                try out.append(allocator, ' ');
+                try appendDecodedShieldsComponent(allocator, out, msg);
+            }
+        }
+        return;
+    }
+    try out.appendSlice(allocator, fallback);
+}
+
+fn parseShieldsLabelMessage(img_url: []const u8) ?struct {
+    label: []const u8,
+    message: ?[]const u8,
+} {
+    const marker = "/badge/";
+    const badge_idx = std.mem.indexOf(u8, img_url, marker) orelse return null;
+    const rest = img_url[badge_idx + marker.len ..];
+    const dot = std.mem.indexOf(u8, rest, ".svg") orelse return null;
+    const body = rest[0..dot];
+
+    const last_dash = std.mem.lastIndexOfScalar(u8, body, '-') orelse return null;
+    const before_color = body[0..last_dash];
+    const split = std.mem.lastIndexOfScalar(u8, before_color, '-') orelse {
+        return .{ .label = before_color, .message = null };
+    };
+
+    return .{ .label = before_color[0..split], .message = before_color[split + 1 ..] };
+}
+
+fn appendDecodedShieldsComponent(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    encoded: []const u8,
+) !void {
+    var i: usize = 0;
+    while (i < encoded.len) {
+        if (encoded[i] == '-' and i + 1 < encoded.len and encoded[i + 1] == '-') {
+            try out.append(allocator, '-');
+            i += 2;
+            continue;
+        }
+        if (encoded[i] == '_') {
+            try out.append(allocator, ' ');
+            i += 1;
+            continue;
+        }
+        if (encoded[i] == '%' and i + 2 < encoded.len) {
+            const a = std.fmt.charToDigit(encoded[i + 1], 16) catch {
+                try out.append(allocator, encoded[i]);
+                i += 1;
+                continue;
+            };
+            const b = std.fmt.charToDigit(encoded[i + 2], 16) catch {
+                try out.append(allocator, encoded[i]);
+                i += 1;
+                continue;
+            };
+            try out.append(allocator, @as(u8, @intCast(a * 16 + b)));
+            i += 3;
+            continue;
+        }
+        try out.append(allocator, encoded[i]);
+        i += 1;
+    }
+}
+
+fn parseShieldsColorName(img_url: []const u8) ?[]const u8 {
+    const marker = "/badge/";
+    const badge_idx = std.mem.indexOf(u8, img_url, marker) orelse return null;
+    const rest = img_url[badge_idx + marker.len ..];
+    const dot = std.mem.indexOf(u8, rest, ".svg") orelse return null;
+    const body = rest[0..dot];
+    const last_dash = std.mem.lastIndexOfScalar(u8, body, '-') orelse return null;
+    if (last_dash + 1 >= body.len) return null;
+    return body[last_dash + 1 ..];
 }
 
 fn embeddedLinkLabel(display: []const u8) ?[]const u8 {
@@ -2009,63 +2138,72 @@ fn drawStyledLine(
     var command: std.ArrayList(u8) = .empty;
     defer command.deinit(allocator);
 
-    const header = try std.fmt.allocPrint(allocator, "BT 1 0 0 1 {d} {d} Tm\n", .{ x, y });
-    try command.appendSlice(allocator, header);
-
     var pen_x = x;
-    const char_w: i32 = @max(1, @divTrunc(font_size * 6, 10));
 
-    var current_style: ?TextStyle = null;
     for (words, 0..) |word, idx| {
-        if (idx != 0) {
-            if (current_style == null or current_style.? != word.style) {
-                const set_font = try std.fmt.allocPrint(
-                    allocator,
-                    "{s} {d} Tf\n",
-                    .{ fontNameForStyle(word.style), font_size },
-                );
-                try command.appendSlice(allocator, set_font);
-                try command.appendSlice(allocator, textColorCommandForStyle(word.style));
-                current_style = word.style;
-            }
-            try command.appendSlice(allocator, "( ) Tj\n");
-            pen_x += char_w;
-        }
-
-        if (current_style == null or current_style.? != word.style) {
-            const set_font = try std.fmt.allocPrint(
-                allocator,
-                "{s} {d} Tf\n",
-                .{ fontNameForStyle(word.style), font_size },
-            );
-            try command.appendSlice(allocator, set_font);
-            try command.appendSlice(allocator, textColorCommandForStyle(word.style));
-            current_style = word.style;
-        }
+        if (idx != 0) pen_x += approxSpaceWidth(word.style, font_size);
 
         const escaped = try escapePdfText(allocator, word.text);
-        const text_cmd = try std.fmt.allocPrint(allocator, "({s}) Tj\n", .{escaped});
-        try command.appendSlice(allocator, text_cmd);
 
         const word_w: i32 = @intCast(word.text.len);
+        const pixel_w = word_w * approxGlyphWidth(word.style, font_size);
+        var link_y1 = y - font_size;
+        var link_y2 = y + 2;
+
+        if (word.badge_color) |bg| {
+            const badge_y = y - @divTrunc(font_size, 3);
+            const badge_h = font_size + 4;
+            const rect = try std.fmt.allocPrint(
+                allocator,
+                "q {d:.3} {d:.3} {d:.3} rg {d} {d} {d} {d} re f Q\n",
+                .{ bg[0], bg[1], bg[2], pen_x - 2, badge_y, pixel_w + 4, badge_h },
+            );
+            try command.appendSlice(allocator, rect);
+            link_y1 = badge_y;
+            link_y2 = badge_y + badge_h;
+        }
+
+        const text_cmd = try std.fmt.allocPrint(
+            allocator,
+            "BT {s} {d} Tf {s}1 0 0 1 {d} {d} Tm ({s}) Tj ET\n",
+            .{ fontNameForStyle(word.style), font_size, textColorCommandForStyle(word.style), pen_x, y, escaped },
+        );
+        try command.appendSlice(allocator, text_cmd);
+
         if (word.link_dest) |dest| {
             if (g_current_link_annots) |cur_annots| {
                 const url_copy = try allocator.alloc(u8, dest.len);
                 std.mem.copyForwards(u8, url_copy, dest);
                 try cur_annots.append(allocator, .{
                     .x1 = pen_x,
-                    .y1 = y - font_size,
-                    .x2 = pen_x + word_w * char_w,
-                    .y2 = y + 2,
+                    .y1 = link_y1,
+                    .x2 = pen_x + pixel_w,
+                    .y2 = link_y2,
                     .url = url_copy,
                 });
             }
         }
-        pen_x += word_w * char_w;
+        pen_x += pixel_w;
     }
 
-    try command.appendSlice(allocator, "ET\n");
     try page_stream.appendSlice(allocator, command.items);
+}
+
+fn approxGlyphWidth(style: TextStyle, font_size: i32) i32 {
+    const factor_percent: i32 = switch (style) {
+        .mono => 60,
+        .bold, .bold_italic => 54,
+        else => 50,
+    };
+    return @max(1, @divTrunc(font_size * factor_percent, 100));
+}
+
+fn approxSpaceWidth(style: TextStyle, font_size: i32) i32 {
+    const factor_percent: i32 = switch (style) {
+        .mono => 60,
+        else => 28,
+    };
+    return @max(1, @divTrunc(font_size * factor_percent, 100));
 }
 
 fn fontNameForStyle(style: TextStyle) []const u8 {
@@ -2076,12 +2214,14 @@ fn fontNameForStyle(style: TextStyle) []const u8 {
         .bold_italic => "/F4",
         .mono => "/F5",
         .link => "/F1",
+        .badge => "/F1",
     };
 }
 
 fn textColorCommandForStyle(style: TextStyle) []const u8 {
     return switch (style) {
         .link => "0.06 0.20 0.72 rg\n",
+        .badge => "1 1 1 rg\n",
         else => "0 0 0 rg\n",
     };
 }
@@ -2195,6 +2335,7 @@ fn appendStyledWord(
     style: TextStyle,
 ) !void {
     var link_dest: ?[]u8 = null;
+    var badge_color: ?[3]f32 = null;
     var copy: []u8 = undefined;
 
     if (extractEmbeddedLinkMarker(text)) |m| {
@@ -2202,6 +2343,7 @@ fn appendStyledWord(
         const url_copy = try allocator.alloc(u8, url.len);
         std.mem.copyForwards(u8, url_copy, url);
         link_dest = url_copy;
+        badge_color = m.badge_color;
 
         const left = text[0..m.marker_start];
         const right = text[m.marker_end..];
@@ -2213,8 +2355,13 @@ fn appendStyledWord(
         std.mem.copyForwards(u8, copy, text);
     }
 
-    const final_style: TextStyle = if (link_dest != null) .link else styleForWord(style, copy);
-    try out.append(allocator, .{ .text = copy, .style = final_style, .link_dest = link_dest });
+    const final_style: TextStyle = if (badge_color != null)
+        .badge
+    else if (link_dest != null)
+        .link
+    else
+        styleForWord(style, copy);
+    try out.append(allocator, .{ .text = copy, .style = final_style, .link_dest = link_dest, .badge_color = badge_color });
 }
 
 fn extractEmbeddedLinkMarker(text: []const u8) ?struct {
@@ -2222,18 +2369,39 @@ fn extractEmbeddedLinkMarker(text: []const u8) ?struct {
     marker_end: usize,
     url_start: usize,
     url_end: usize,
+    badge_color: ?[3]f32,
 } {
     const marker_start = std.mem.lastIndexOf(u8, text, "<<@") orelse return null;
     const marker_end_incl = std.mem.indexOfPos(u8, text, marker_start + 3, "@>>") orelse return null;
+    const meta = text[marker_start + 3 .. marker_end_incl];
+    const color_sep = std.mem.lastIndexOf(u8, meta, "|c=");
+
     const url_start = marker_start + 3;
-    const url_end = marker_end_incl;
+    var url_end = marker_end_incl;
+    var badge_color: ?[3]f32 = null;
+    if (color_sep) |sep| {
+        url_end = marker_start + 3 + sep;
+        const color_name = meta[sep + 3 ..];
+        badge_color = badgeColorForName(color_name);
+    }
+
     if (marker_start == 0 or url_end <= url_start) return null;
     return .{
         .marker_start = marker_start,
         .marker_end = marker_end_incl + 3,
         .url_start = url_start,
         .url_end = url_end,
+        .badge_color = badge_color,
     };
+}
+
+fn badgeColorForName(name: []const u8) ?[3]f32 {
+    if (std.ascii.eqlIgnoreCase(name, "green") or std.ascii.eqlIgnoreCase(name, "brightgreen")) return .{ 0.18, 0.55, 0.34 };
+    if (std.ascii.eqlIgnoreCase(name, "blue")) return .{ 0.16, 0.47, 0.76 };
+    if (std.ascii.eqlIgnoreCase(name, "red")) return .{ 0.74, 0.26, 0.26 };
+    if (std.ascii.eqlIgnoreCase(name, "yellow") or std.ascii.eqlIgnoreCase(name, "orange")) return .{ 0.79, 0.53, 0.18 };
+    if (std.ascii.eqlIgnoreCase(name, "grey") or std.ascii.eqlIgnoreCase(name, "gray")) return .{ 0.43, 0.47, 0.50 };
+    return .{ 0.16, 0.47, 0.76 };
 }
 
 fn styleForWord(base: TextStyle, text: []const u8) TextStyle {
@@ -2694,7 +2862,10 @@ test "reference link resolution" {
 
     const resolved = try resolveReferenceLinks(allocator, "See [API][Docs] and [Docs].", &refs);
     defer if (resolved.ptr != "See [API][Docs] and [Docs].".ptr) allocator.free(resolved);
-    try std.testing.expectEqualStrings("See API (https://example.com/docs) and Docs (https://example.com/docs).", resolved);
+    try std.testing.expectEqualStrings(
+        "See API<<@https://example.com/docs@>> and Docs<<@https://example.com/docs@>>.",
+        resolved,
+    );
 }
 
 test "inline link and autolink resolution" {
@@ -2706,7 +2877,7 @@ test "inline link and autolink resolution" {
     const resolved = try resolveReferenceLinks(allocator, input, &refs);
     defer if (resolved.ptr != input.ptr) allocator.free(resolved);
     try std.testing.expectEqualStrings(
-        "Read guide (https://example.com/guide) and https://example.com/api (https://example.com/api).",
+        "Read guide<<@https://example.com/guide@>> and https://example.com/api<<@https://example.com/api@>>.",
         resolved,
     );
 }
@@ -2747,6 +2918,23 @@ test "bracket display links are styled as links" {
     try std.testing.expect(words.items.len >= 3);
     try std.testing.expect(words.items[1].style == .link);
     try std.testing.expect(words.items[3].style == .link);
+}
+
+test "shields label message parse" {
+    const parts = parseShieldsLabelMessage("https://img.shields.io/badge/SDL-3.2.0+-green.svg").?;
+    try std.testing.expectEqualStrings("SDL", parts.label);
+    try std.testing.expectEqualStrings("3.2.0+", parts.message.?);
+}
+
+test "badge markdown resolves to label plus message" {
+    const allocator = std.testing.allocator;
+    var refs = std.StringHashMap([]const u8).init(allocator);
+    defer refs.deinit();
+
+    const input = "[![SDL3](https://img.shields.io/badge/SDL-3.2.0+-green.svg)](https://www.libsdl.org/)";
+    const resolved = try resolveReferenceLinks(allocator, input, &refs);
+    defer if (resolved.ptr != input.ptr) allocator.free(resolved);
+    try std.testing.expectEqualStrings("SDL 3.2.0+<<@https://www.libsdl.org/|c=green@>>", resolved);
 }
 
 test "zig code tokenization applies highlight kinds" {
