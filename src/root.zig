@@ -118,6 +118,11 @@ fn renderMarkdownAsPdf(allocator: std.mem.Allocator, markdown: []const u8) ![]u8
     var indented_code_block: std.ArrayList(u8) = .empty;
     defer indented_code_block.deinit(allocator);
 
+    var pending_table_header: ?[]const u8 = null;
+    var in_table_block = false;
+    var table_rows: std.ArrayList([]const u8) = .empty;
+    defer table_rows.deinit(allocator);
+
     var active_list_level: ?usize = null;
     var active_list_text_x: i32 = 0;
     var active_list_max: usize = 0;
@@ -129,6 +134,43 @@ fn renderMarkdownAsPdf(allocator: std.mem.Allocator, markdown: []const u8) ![]u8
     while (it.next()) |line_raw| {
         const line = std.mem.trimRight(u8, line_raw, "\r");
         const trimmed = std.mem.trim(u8, line, " \t");
+
+        if (in_table_block) {
+            if (trimmed.len > 0 and looksLikeTableRow(line)) {
+                try table_rows.append(allocator, line);
+                continue;
+            }
+
+            try drawTableBlock(
+                allocator,
+                &page_streams,
+                &current_page,
+                &has_page,
+                &cursor_y,
+                table_rows.items,
+                margin_left,
+                margin_top,
+                margin_bottom,
+                page_height,
+            );
+            try table_rows.resize(allocator, 0);
+            in_table_block = false;
+        }
+
+        if (pending_table_header) |header| {
+            if (isTableDelimiterLine(trimmed)) {
+                try table_rows.append(allocator, header);
+                in_table_block = true;
+                pending_table_header = null;
+                continue;
+            }
+
+            if (paragraph.items.len != 0) {
+                try paragraph.append(allocator, ' ');
+            }
+            try paragraph.appendSlice(allocator, std.mem.trim(u8, header, " \t"));
+            pending_table_header = null;
+        }
 
         if (in_indented_code_block) {
             const indent_cols = leadingIndentColumns(line);
@@ -190,6 +232,7 @@ fn renderMarkdownAsPdf(allocator: std.mem.Allocator, markdown: []const u8) ![]u8
             in_list_block = false;
             list_loose = false;
             pending_list_blank = false;
+            pending_table_header = null;
             if (paragraph.items.len > 0) {
                 try drawWrapped(
                     allocator,
@@ -230,6 +273,7 @@ fn renderMarkdownAsPdf(allocator: std.mem.Allocator, markdown: []const u8) ![]u8
         }
 
         if (trimmed.len == 0) {
+            pending_table_header = null;
             if (in_list_block) {
                 pending_list_blank = true;
                 active_list_level = null;
@@ -262,6 +306,7 @@ fn renderMarkdownAsPdf(allocator: std.mem.Allocator, markdown: []const u8) ![]u8
 
         if (!in_list_block and paragraph.items.len > 0) {
             if (parseSetextUnderline(trimmed)) |setext_level| {
+                pending_table_header = null;
                 const heading_size: i32 = switch (setext_level) {
                     1 => 24,
                     else => 18,
@@ -294,6 +339,7 @@ fn renderMarkdownAsPdf(allocator: std.mem.Allocator, markdown: []const u8) ![]u8
         }
 
         if (isThematicBreak(trimmed)) {
+            pending_table_header = null;
             active_list_level = null;
             in_list_block = false;
             list_loose = false;
@@ -325,6 +371,7 @@ fn renderMarkdownAsPdf(allocator: std.mem.Allocator, markdown: []const u8) ![]u8
         }
 
         if (parseBlockquoteLine(line)) |quote| {
+            pending_table_header = null;
             active_list_level = null;
             in_list_block = false;
             list_loose = false;
@@ -384,6 +431,7 @@ fn renderMarkdownAsPdf(allocator: std.mem.Allocator, markdown: []const u8) ![]u8
         }
 
         if (parseListItem(line)) |item| {
+            pending_table_header = null;
             if (!in_list_block) {
                 in_list_block = true;
                 list_loose = false;
@@ -447,6 +495,7 @@ fn renderMarkdownAsPdf(allocator: std.mem.Allocator, markdown: []const u8) ![]u8
 
         if (active_list_level) |level| {
             if (isListContinuation(line, level)) {
+                pending_table_header = null;
                 if (paragraph.items.len > 0) {
                     try drawWrapped(
                         allocator,
@@ -493,6 +542,7 @@ fn renderMarkdownAsPdf(allocator: std.mem.Allocator, markdown: []const u8) ![]u8
         pending_list_blank = false;
 
         if (trimmed[0] == '#') {
+            pending_table_header = null;
             if (paragraph.items.len > 0) {
                 try drawWrapped(
                     allocator,
@@ -548,10 +598,37 @@ fn renderMarkdownAsPdf(allocator: std.mem.Allocator, markdown: []const u8) ![]u8
             continue;
         }
 
+        if (!in_list_block and paragraph.items.len == 0 and looksLikeTableRow(line)) {
+            pending_table_header = line;
+            continue;
+        }
+
         if (paragraph.items.len != 0) {
             try paragraph.append(allocator, ' ');
         }
         try paragraph.appendSlice(allocator, trimmed);
+    }
+
+    if (pending_table_header) |header| {
+        if (paragraph.items.len != 0) {
+            try paragraph.append(allocator, ' ');
+        }
+        try paragraph.appendSlice(allocator, std.mem.trim(u8, header, " \t"));
+    }
+
+    if (in_table_block and table_rows.items.len > 0) {
+        try drawTableBlock(
+            allocator,
+            &page_streams,
+            &current_page,
+            &has_page,
+            &cursor_y,
+            table_rows.items,
+            margin_left,
+            margin_top,
+            margin_bottom,
+            page_height,
+        );
     }
 
     if (in_code_block and code_block.items.len > 0) {
@@ -755,6 +832,142 @@ fn drawCodeBlock(
         cursor_y.* -= line_height;
     }
     cursor_y.* -= 6;
+}
+
+fn drawTableBlock(
+    allocator: std.mem.Allocator,
+    page_streams: *std.ArrayList([]u8),
+    current_page: *std.ArrayList(u8),
+    has_page: *bool,
+    cursor_y: *i32,
+    rows: []const []const u8,
+    x: i32,
+    margin_top: i32,
+    margin_bottom: i32,
+    page_height: i32,
+) !void {
+    if (rows.len == 0) return;
+
+    var header_cells = try splitTableCells(allocator, rows[0]);
+    defer header_cells.deinit(allocator);
+    if (header_cells.items.len == 0) return;
+
+    const cols = header_cells.items.len;
+    var widths = try allocator.alloc(usize, cols);
+    defer allocator.free(widths);
+    for (widths, 0..) |*w, i| w.* = @max(@as(usize, 3), header_cells.items[i].len);
+
+    for (rows[1..]) |row| {
+        var cells = try splitTableCells(allocator, row);
+        defer cells.deinit(allocator);
+        var i: usize = 0;
+        while (i < cols and i < cells.items.len) : (i += 1) {
+            widths[i] = @max(widths[i], cells.items[i].len);
+        }
+    }
+
+    const sep_and_border = cols * 3 + 1;
+    var content_space: usize = 84;
+    if (sep_and_border < content_space) content_space -= sep_and_border else content_space = cols * 3;
+    const per_col = @max(@as(usize, 4), content_space / cols);
+    for (widths) |*w| w.* = @min(w.*, per_col);
+
+    cursor_y.* -= 2;
+    const line_height: i32 = 14;
+
+    const header_line = try buildTableDisplayLine(allocator, header_cells.items, widths);
+    try ensureSpace(allocator, page_streams, current_page, has_page, cursor_y, line_height, margin_top, margin_bottom, page_height);
+    try drawTextLineWithStyle(allocator, current_page, header_line, x, cursor_y.*, 11, .mono);
+    cursor_y.* -= line_height;
+
+    const rule_line = try buildTableRuleLine(allocator, widths);
+    try ensureSpace(allocator, page_streams, current_page, has_page, cursor_y, line_height, margin_top, margin_bottom, page_height);
+    try drawTextLineWithStyle(allocator, current_page, rule_line, x, cursor_y.*, 11, .mono);
+    cursor_y.* -= line_height;
+
+    for (rows[1..]) |row| {
+        var cells = try splitTableCells(allocator, row);
+        defer cells.deinit(allocator);
+        const display = try buildTableDisplayLine(allocator, cells.items, widths);
+        try ensureSpace(allocator, page_streams, current_page, has_page, cursor_y, line_height, margin_top, margin_bottom, page_height);
+        try drawTextLineWithStyle(allocator, current_page, display, x, cursor_y.*, 11, .mono);
+        cursor_y.* -= line_height;
+    }
+
+    cursor_y.* -= 4;
+}
+
+fn buildTableDisplayLine(allocator: std.mem.Allocator, cells: []const []const u8, widths: []const usize) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    try out.append(allocator, '|');
+    for (widths, 0..) |w, i| {
+        try out.append(allocator, ' ');
+        const text = if (i < cells.len) cells[i] else "";
+        const clipped_len = @min(text.len, w);
+        try out.appendSlice(allocator, text[0..clipped_len]);
+        var pad = clipped_len;
+        while (pad < w) : (pad += 1) try out.append(allocator, ' ');
+        try out.appendSlice(allocator, " |");
+    }
+
+    return out.toOwnedSlice(allocator);
+}
+
+fn buildTableRuleLine(allocator: std.mem.Allocator, widths: []const usize) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+
+    try out.append(allocator, '|');
+    for (widths) |w| {
+        var i: usize = 0;
+        while (i < w + 2) : (i += 1) try out.append(allocator, '-');
+        try out.append(allocator, '|');
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+fn splitTableCells(allocator: std.mem.Allocator, line: []const u8) !std.ArrayList([]const u8) {
+    var cells: std.ArrayList([]const u8) = .empty;
+    errdefer cells.deinit(allocator);
+
+    const trimmed = std.mem.trim(u8, line, " \t");
+    var work = trimmed;
+    if (work.len > 0 and work[0] == '|') work = work[1..];
+    if (work.len > 0 and work[work.len - 1] == '|') work = work[0 .. work.len - 1];
+
+    var it = std.mem.splitScalar(u8, work, '|');
+    while (it.next()) |part| {
+        try cells.append(allocator, std.mem.trim(u8, part, " \t"));
+    }
+    return cells;
+}
+
+fn looksLikeTableRow(line: []const u8) bool {
+    const trimmed = std.mem.trim(u8, line, " \t");
+    if (trimmed.len == 0) return false;
+    if (std.mem.indexOfScalar(u8, trimmed, '|') == null) return false;
+    return true;
+}
+
+fn isTableDelimiterLine(trimmed_line: []const u8) bool {
+    if (trimmed_line.len == 0) return false;
+    var has_dash = false;
+    var has_pipe = false;
+    for (trimmed_line) |c| {
+        if (c == '-') {
+            has_dash = true;
+            continue;
+        }
+        if (c == '|') {
+            has_pipe = true;
+            continue;
+        }
+        if (c == ':' or c == ' ' or c == '\t') continue;
+        return false;
+    }
+    return has_dash and has_pipe;
 }
 
 fn drawCodeLineWithHighlight(
@@ -1915,6 +2128,24 @@ test "parse setext underline" {
     try std.testing.expectEqual(@as(?u8, 2), parseSetextUnderline(" - - - "));
     try std.testing.expect(parseSetextUnderline("--=") == null);
     try std.testing.expect(parseSetextUnderline("text") == null);
+}
+
+test "table delimiter detection" {
+    try std.testing.expect(isTableDelimiterLine("| --- | :---: |"));
+    try std.testing.expect(isTableDelimiterLine("---|---"));
+    try std.testing.expect(!isTableDelimiterLine("| a | b |"));
+    try std.testing.expect(!isTableDelimiterLine("---"));
+}
+
+test "table row split" {
+    const allocator = std.testing.allocator;
+    var cells = try splitTableCells(allocator, "| name | age | city |");
+    defer cells.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 3), cells.items.len);
+    try std.testing.expectEqualStrings("name", cells.items[0]);
+    try std.testing.expectEqualStrings("age", cells.items[1]);
+    try std.testing.expectEqualStrings("city", cells.items[2]);
 }
 
 test "zig code tokenization applies highlight kinds" {
