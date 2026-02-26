@@ -109,6 +109,10 @@ fn renderMarkdownAsPdf(allocator: std.mem.Allocator, markdown: []const u8) ![]u8
     defer code_block.deinit(allocator);
     var code_lang: ?[]const u8 = null;
 
+    var active_list_level: ?usize = null;
+    var active_list_text_x: i32 = 0;
+    var active_list_max: usize = 0;
+
     var it = std.mem.splitScalar(u8, markdown, '\n');
     while (it.next()) |line_raw| {
         const line = std.mem.trimRight(u8, line_raw, "\r");
@@ -140,6 +144,7 @@ fn renderMarkdownAsPdf(allocator: std.mem.Allocator, markdown: []const u8) ![]u8
         }
 
         if (std.mem.startsWith(u8, trimmed, "```")) {
+            active_list_level = null;
             if (paragraph.items.len > 0) {
                 try drawWrapped(
                     allocator,
@@ -165,6 +170,7 @@ fn renderMarkdownAsPdf(allocator: std.mem.Allocator, markdown: []const u8) ![]u8
         }
 
         if (trimmed.len == 0) {
+            active_list_level = null;
             if (paragraph.items.len > 0) {
                 try drawWrapped(
                     allocator,
@@ -188,6 +194,7 @@ fn renderMarkdownAsPdf(allocator: std.mem.Allocator, markdown: []const u8) ![]u8
         }
 
         if (isThematicBreak(trimmed)) {
+            active_list_level = null;
             if (paragraph.items.len > 0) {
                 try drawWrapped(
                     allocator,
@@ -257,8 +264,56 @@ fn renderMarkdownAsPdf(allocator: std.mem.Allocator, markdown: []const u8) ![]u8
                 margin_bottom,
                 page_height,
             );
+
+            active_list_level = item.level;
+            active_list_text_x = item_x + 20;
+            active_list_max = if (item_max > 4) item_max - 4 else item_max;
             continue;
         }
+
+        if (active_list_level) |level| {
+            if (isListContinuation(line, level)) {
+                if (paragraph.items.len > 0) {
+                    try drawWrapped(
+                        allocator,
+                        &page_streams,
+                        &current_page,
+                        &has_page,
+                        &cursor_y,
+                        paragraph.items,
+                        margin_left,
+                        12,
+                        16,
+                        80,
+                        margin_top,
+                        margin_bottom,
+                        page_height,
+                    );
+                    try paragraph.resize(allocator, 0);
+                    cursor_y -= 4;
+                }
+
+                const continuation = std.mem.trimLeft(u8, line, " \t");
+                try drawWrapped(
+                    allocator,
+                    &page_streams,
+                    &current_page,
+                    &has_page,
+                    &cursor_y,
+                    continuation,
+                    active_list_text_x,
+                    12,
+                    16,
+                    active_list_max,
+                    margin_top,
+                    margin_bottom,
+                    page_height,
+                );
+                continue;
+            }
+        }
+
+        active_list_level = null;
 
         if (trimmed[0] == '#') {
             if (paragraph.items.len > 0) {
@@ -313,47 +368,6 @@ fn renderMarkdownAsPdf(allocator: std.mem.Allocator, markdown: []const u8) ![]u8
                 page_height,
             );
             cursor_y -= 6;
-            continue;
-        }
-
-        if (std.mem.startsWith(u8, trimmed, "- ") or std.mem.startsWith(u8, trimmed, "* ")) {
-            if (paragraph.items.len > 0) {
-                try drawWrapped(
-                    allocator,
-                    &page_streams,
-                    &current_page,
-                    &has_page,
-                    &cursor_y,
-                    paragraph.items,
-                    margin_left,
-                    12,
-                    16,
-                    80,
-                    margin_top,
-                    margin_bottom,
-                    page_height,
-                );
-                try paragraph.resize(allocator, 0);
-                cursor_y -= 4;
-            }
-
-            const bullet_body = std.mem.trimLeft(u8, trimmed[2..], " ");
-            const bullet_text = try std.fmt.allocPrint(allocator, "- {s}", .{bullet_body});
-            try drawWrapped(
-                allocator,
-                &page_streams,
-                &current_page,
-                &has_page,
-                &cursor_y,
-                bullet_text,
-                margin_left,
-                12,
-                16,
-                76,
-                margin_top,
-                margin_bottom,
-                page_height,
-            );
             continue;
         }
 
@@ -658,6 +672,33 @@ fn parseListItem(line: []const u8) ?ListItemInfo {
         .marker = line[start .. punct + 1],
         .content_start = punct + 2,
     };
+}
+
+fn isListContinuation(line: []const u8, active_level: usize) bool {
+    const trimmed = std.mem.trim(u8, line, " \t");
+    if (trimmed.len == 0) return false;
+    if (std.mem.startsWith(u8, trimmed, "```")) return false;
+    if (parseListItem(line) != null) return false;
+
+    const indent_cols = leadingIndentColumns(line);
+    return indent_cols >= (active_level + 1) * 2;
+}
+
+fn leadingIndentColumns(line: []const u8) usize {
+    var i: usize = 0;
+    var cols: usize = 0;
+    while (i < line.len) : (i += 1) {
+        if (line[i] == ' ') {
+            cols += 1;
+            continue;
+        }
+        if (line[i] == '\t') {
+            cols += 4;
+            continue;
+        }
+        break;
+    }
+    return cols;
 }
 
 fn tokenizeCodeLine(
@@ -1585,6 +1626,12 @@ test "non list lines are ignored" {
     try std.testing.expect(parseListItem("abc- not list") == null);
     try std.testing.expect(parseListItem("-not list") == null);
     try std.testing.expect(parseListItem("1.not list") == null);
+}
+
+test "list continuation detection" {
+    try std.testing.expect(isListContinuation("    continuation text", 1));
+    try std.testing.expect(!isListContinuation("  too shallow", 1));
+    try std.testing.expect(!isListContinuation("    - nested list", 1));
 }
 
 test "zig code tokenization applies highlight kinds" {
