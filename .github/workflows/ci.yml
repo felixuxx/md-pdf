@@ -33,5 +33,13 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: zig build -Dtarget=x86_64-linux-gnu
 
+      - name: Build macOS target
+        if: matrix.os == 'macos-latest'
+        run: zig build -Dtarget=aarch64-macos
+
+      - name: Build Windows target
+        if: matrix.os == 'windows-latest'
+        run: zig build -Dtarget=x86_64-windows-gnu
+
       - name: Run Tests
         run: zig build test
