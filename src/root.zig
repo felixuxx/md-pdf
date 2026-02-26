@@ -21,6 +21,7 @@ const StyledWord = struct {
 const CodeTokenKind = enum {
     normal,
     keyword,
+    command,
     string,
     number,
     comment,
@@ -527,6 +528,7 @@ fn colorCommandForCodeToken(kind: CodeTokenKind) []const u8 {
     return switch (kind) {
         .normal => "0 0 0 rg\n",
         .keyword => "0.09 0.21 0.58 rg\n",
+        .command => "0.42 0.08 0.50 rg\n",
         .string => "0.62 0.16 0.15 rg\n",
         .number => "0.10 0.45 0.48 rg\n",
         .comment => "0.20 0.43 0.17 rg\n",
@@ -685,11 +687,45 @@ fn tokenizeBashCodeLine(allocator: std.mem.Allocator, line: []const u8) !std.Arr
     var out: std.ArrayList(CodeToken) = .empty;
     errdefer out.deinit(allocator);
 
+    var expecting_command = true;
     var i: usize = 0;
     while (i < line.len) {
+        if (std.ascii.isWhitespace(line[i])) {
+            const start_ws = i;
+            i += 1;
+            while (i < line.len and std.ascii.isWhitespace(line[i])) : (i += 1) {}
+            try out.append(allocator, .{ .text = line[start_ws..i], .kind = .normal });
+            continue;
+        }
+
         if (line[i] == '#' and (i == 0 or std.ascii.isWhitespace(line[i - 1]))) {
             try out.append(allocator, .{ .text = line[i..], .kind = .comment });
             break;
+        }
+
+        if (isBashCommandSeparator(line, i)) |sep_len| {
+            try out.append(allocator, .{ .text = line[i .. i + sep_len], .kind = .normal });
+            i += sep_len;
+            expecting_command = true;
+            continue;
+        }
+
+        if (line[i] == '`') {
+            const start = i;
+            i += 1;
+            while (i < line.len) : (i += 1) {
+                if (line[i] == '\\' and i + 1 < line.len) {
+                    i += 1;
+                    continue;
+                }
+                if (line[i] == '`') {
+                    i += 1;
+                    break;
+                }
+            }
+            try out.append(allocator, .{ .text = line[start..@min(i, line.len)], .kind = .keyword });
+            expecting_command = false;
+            continue;
         }
 
         if (line[i] == '"' or line[i] == '\'') {
@@ -707,20 +743,26 @@ fn tokenizeBashCodeLine(allocator: std.mem.Allocator, line: []const u8) !std.Arr
                 }
             }
             try out.append(allocator, .{ .text = line[start..@min(i, line.len)], .kind = .string });
+            expecting_command = false;
             continue;
         }
 
         if (line[i] == '$') {
             const start = i;
-            i += 1;
-            if (i < line.len and line[i] == '{') {
-                i += 1;
-                while (i < line.len and line[i] != '}') : (i += 1) {}
-                if (i < line.len) i += 1;
+            if (i + 1 < line.len and line[i + 1] == '(') {
+                i = parseDollarParenSubstitutionEnd(line, i);
             } else {
-                while (i < line.len and isBashIdentContinue(line[i])) : (i += 1) {}
+                i += 1;
+                if (i < line.len and line[i] == '{') {
+                    i += 1;
+                    while (i < line.len and line[i] != '}') : (i += 1) {}
+                    if (i < line.len) i += 1;
+                } else {
+                    while (i < line.len and isBashIdentContinue(line[i])) : (i += 1) {}
+                }
             }
             try out.append(allocator, .{ .text = line[start..@max(start + 1, i)], .kind = .keyword });
+            expecting_command = false;
             continue;
         }
 
@@ -729,6 +771,7 @@ fn tokenizeBashCodeLine(allocator: std.mem.Allocator, line: []const u8) !std.Arr
             i += 1;
             while (i < line.len and (std.ascii.isDigit(line[i]) or line[i] == '.')) : (i += 1) {}
             try out.append(allocator, .{ .text = line[start..i], .kind = .number });
+            expecting_command = false;
             continue;
         }
 
@@ -737,7 +780,18 @@ fn tokenizeBashCodeLine(allocator: std.mem.Allocator, line: []const u8) !std.Arr
             i += 1;
             while (i < line.len and isBashIdentContinue(line[i])) : (i += 1) {}
             const word = line[start..i];
-            try out.append(allocator, .{ .text = word, .kind = if (isBashKeyword(word)) .keyword else .normal });
+
+            const kind: CodeTokenKind = kind: {
+                if (isBashKeyword(word)) break :kind .keyword;
+                if (expecting_command and isCommonBashCommand(word)) break :kind .command;
+                break :kind .normal;
+            };
+            try out.append(allocator, .{ .text = word, .kind = kind });
+            if (kind == .keyword and bashKeywordStartsCommand(word)) {
+                expecting_command = true;
+            } else if (!isEnvAssignment(word)) {
+                expecting_command = false;
+            }
             continue;
         }
 
@@ -745,9 +799,78 @@ fn tokenizeBashCodeLine(allocator: std.mem.Allocator, line: []const u8) !std.Arr
         i += 1;
         while (i < line.len and !isBashTokenBoundary(line, i)) : (i += 1) {}
         try out.append(allocator, .{ .text = line[start..i], .kind = .normal });
+        expecting_command = false;
     }
 
     return out;
+}
+
+fn isBashCommandSeparator(line: []const u8, i: usize) ?usize {
+    if (line[i] == '|') {
+        if (i + 1 < line.len and line[i + 1] == '|') return 2;
+        return 1;
+    }
+    if (line[i] == ';') return 1;
+    if (line[i] == '&' and i + 1 < line.len and line[i + 1] == '&') return 2;
+    return null;
+}
+
+fn isEnvAssignment(word: []const u8) bool {
+    const eq = std.mem.indexOfScalar(u8, word, '=') orelse return false;
+    if (eq == 0) return false;
+    var i: usize = 0;
+    while (i < eq) : (i += 1) {
+        const c = word[i];
+        if (i == 0) {
+            if (!isBashIdentStart(c)) return false;
+        } else if (!isBashIdentContinue(c)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn parseDollarParenSubstitutionEnd(line: []const u8, start_idx: usize) usize {
+    var i = start_idx + 2;
+    var depth: usize = 1;
+
+    while (i < line.len) : (i += 1) {
+        if (line[i] == '\\' and i + 1 < line.len) {
+            i += 1;
+            continue;
+        }
+
+        if (line[i] == '\'') {
+            i += 1;
+            while (i < line.len and line[i] != '\'') : (i += 1) {}
+            continue;
+        }
+
+        if (line[i] == '"') {
+            i += 1;
+            while (i < line.len) : (i += 1) {
+                if (line[i] == '\\' and i + 1 < line.len) {
+                    i += 1;
+                    continue;
+                }
+                if (line[i] == '"') break;
+            }
+            continue;
+        }
+
+        if (line[i] == '$' and i + 1 < line.len and line[i + 1] == '(') {
+            depth += 1;
+            i += 1;
+            continue;
+        }
+
+        if (line[i] == ')') {
+            depth -= 1;
+            if (depth == 0) return i + 1;
+        }
+    }
+
+    return line.len;
 }
 
 fn isCodeNumberChar(c: u8) bool {
@@ -786,7 +909,7 @@ fn isBashIdentContinue(c: u8) bool {
 fn isBashTokenBoundary(line: []const u8, idx: usize) bool {
     const c = line[idx];
     if (std.ascii.isWhitespace(c)) return true;
-    if (c == '"' or c == '\'' or c == '$') return true;
+    if (c == '"' or c == '\'' or c == '$' or c == '`') return true;
     if (c == '#' and (idx == 0 or std.ascii.isWhitespace(line[idx - 1]))) return true;
     if (isBashIdentStart(c) or std.ascii.isDigit(c)) return true;
     return false;
@@ -810,13 +933,33 @@ fn isZigKeyword(word: []const u8) bool {
 
 fn isBashKeyword(word: []const u8) bool {
     const keywords = [_][]const u8{
-        "if",    "then",   "else",   "elif",  "fi",       "for",  "while",  "do", "done", "in", "case", "esac", "function",
-        "local", "export", "return", "break", "continue", "echo", "printf", "cd", "test", "[[", "]]",
+        "if",    "then",   "else",   "elif",  "fi",       "for", "while", "do", "done", "in", "case", "esac", "function",
+        "local", "export", "return", "break", "continue", "[[",  "]]",
     };
     for (keywords) |k| {
         if (std.mem.eql(u8, k, word)) return true;
     }
     return false;
+}
+
+fn isCommonBashCommand(word: []const u8) bool {
+    const commands = [_][]const u8{
+        "echo", "printf",   "cd",      "pwd",   "ls",     "cat",   "grep",  "sed", "awk", "cut", "sort",  "uniq",  "tr",
+        "head", "tail",     "find",    "xargs", "chmod",  "chown", "mkdir", "rm",  "cp",  "mv",  "touch", "which", "command",
+        "test", "basename", "dirname", "env",   "export", "read",  "tee",   "wc",
+    };
+    for (commands) |cmd| {
+        if (std.mem.eql(u8, cmd, word)) return true;
+    }
+    return false;
+}
+
+fn bashKeywordStartsCommand(word: []const u8) bool {
+    return std.mem.eql(u8, word, "if") or
+        std.mem.eql(u8, word, "then") or
+        std.mem.eql(u8, word, "else") or
+        std.mem.eql(u8, word, "elif") or
+        std.mem.eql(u8, word, "do");
 }
 
 fn drawHorizontalRule(
@@ -1333,21 +1476,60 @@ test "json code tokenization applies highlight kinds" {
 
 test "bash code tokenization applies highlight kinds" {
     const allocator = std.testing.allocator;
-    var tokens = try tokenizeCodeLine(allocator, "if [ \"$n\" -gt 2 ]; then echo \"ok\" # done", "bash");
+    var tokens = try tokenizeCodeLine(allocator, "if [ \"$n\" -gt 2 ]; then echo \"ok\" | grep ok # done", "bash");
     defer tokens.deinit(allocator);
 
     var found_if = false;
+    var found_echo = false;
+    var found_grep = false;
     var found_number = false;
     var found_string = false;
     var found_comment = false;
     for (tokens.items) |tok| {
         if (std.mem.eql(u8, tok.text, "if") and tok.kind == .keyword) found_if = true;
+        if (std.mem.eql(u8, tok.text, "echo") and tok.kind == .command) found_echo = true;
+        if (std.mem.eql(u8, tok.text, "grep") and tok.kind == .command) found_grep = true;
         if (std.mem.eql(u8, tok.text, "2") and tok.kind == .number) found_number = true;
         if (std.mem.eql(u8, tok.text, "\"$n\"") and tok.kind == .string) found_string = true;
         if (std.mem.eql(u8, tok.text, "# done") and tok.kind == .comment) found_comment = true;
     }
     try std.testing.expect(found_if);
+    try std.testing.expect(found_echo);
+    try std.testing.expect(found_grep);
     try std.testing.expect(found_number);
     try std.testing.expect(found_string);
     try std.testing.expect(found_comment);
+}
+
+test "bash command substitutions are highlighted" {
+    const allocator = std.testing.allocator;
+    var tokens = try tokenizeCodeLine(allocator, "echo $(date +%s) and ${USER}", "bash");
+    defer tokens.deinit(allocator);
+
+    var found_echo = false;
+    var found_subst = false;
+    var found_braced = false;
+    for (tokens.items) |tok| {
+        if (std.mem.eql(u8, tok.text, "echo") and tok.kind == .command) found_echo = true;
+        if (std.mem.eql(u8, tok.text, "$(date +%s)") and tok.kind == .keyword) found_subst = true;
+        if (std.mem.eql(u8, tok.text, "${USER}") and tok.kind == .keyword) found_braced = true;
+    }
+    try std.testing.expect(found_echo);
+    try std.testing.expect(found_subst);
+    try std.testing.expect(found_braced);
+}
+
+test "bash backticks are highlighted" {
+    const allocator = std.testing.allocator;
+    var tokens = try tokenizeCodeLine(allocator, "echo `uname -s`", "bash");
+    defer tokens.deinit(allocator);
+
+    var found_echo = false;
+    var found_tick = false;
+    for (tokens.items) |tok| {
+        if (std.mem.eql(u8, tok.text, "echo") and tok.kind == .command) found_echo = true;
+        if (std.mem.eql(u8, tok.text, "`uname -s`") and tok.kind == .keyword) found_tick = true;
+    }
+    try std.testing.expect(found_echo);
+    try std.testing.expect(found_tick);
 }
