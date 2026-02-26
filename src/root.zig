@@ -114,6 +114,10 @@ fn renderMarkdownAsPdf(allocator: std.mem.Allocator, markdown: []const u8) ![]u8
     defer code_block.deinit(allocator);
     var code_lang: ?[]const u8 = null;
 
+    var in_indented_code_block = false;
+    var indented_code_block: std.ArrayList(u8) = .empty;
+    defer indented_code_block.deinit(allocator);
+
     var active_list_level: ?usize = null;
     var active_list_text_x: i32 = 0;
     var active_list_max: usize = 0;
@@ -125,6 +129,36 @@ fn renderMarkdownAsPdf(allocator: std.mem.Allocator, markdown: []const u8) ![]u8
     while (it.next()) |line_raw| {
         const line = std.mem.trimRight(u8, line_raw, "\r");
         const trimmed = std.mem.trim(u8, line, " \t");
+
+        if (in_indented_code_block) {
+            const indent_cols = leadingIndentColumns(line);
+            if (trimmed.len == 0) {
+                try indented_code_block.append(allocator, '\n');
+                continue;
+            }
+            if (indent_cols >= 4) {
+                const content_start = skipIndentColumns(line, 4);
+                try indented_code_block.appendSlice(allocator, line[content_start..]);
+                try indented_code_block.append(allocator, '\n');
+                continue;
+            }
+
+            try drawCodeBlock(
+                allocator,
+                &page_streams,
+                &current_page,
+                &has_page,
+                &cursor_y,
+                indented_code_block.items,
+                null,
+                margin_left,
+                margin_top,
+                margin_bottom,
+                page_height,
+            );
+            try indented_code_block.resize(allocator, 0);
+            in_indented_code_block = false;
+        }
 
         if (in_code_block) {
             if (std.mem.startsWith(u8, trimmed, "```")) {
@@ -177,6 +211,21 @@ fn renderMarkdownAsPdf(allocator: std.mem.Allocator, markdown: []const u8) ![]u8
             }
             in_code_block = true;
             code_lang = parseFenceLanguage(trimmed);
+            continue;
+        }
+
+        if (trimmed.len > 0 and leadingIndentColumns(line) >= 4 and paragraph.items.len == 0 and
+            parseListItem(line) == null and parseBlockquoteLine(line) == null)
+        {
+            active_list_level = null;
+            in_list_block = false;
+            list_loose = false;
+            pending_list_blank = false;
+            in_indented_code_block = true;
+
+            const content_start = skipIndentColumns(line, 4);
+            try indented_code_block.appendSlice(allocator, line[content_start..]);
+            try indented_code_block.append(allocator, '\n');
             continue;
         }
 
@@ -514,6 +563,22 @@ fn renderMarkdownAsPdf(allocator: std.mem.Allocator, markdown: []const u8) ![]u8
             &cursor_y,
             code_block.items,
             code_lang,
+            margin_left,
+            margin_top,
+            margin_bottom,
+            page_height,
+        );
+    }
+
+    if (in_indented_code_block and indented_code_block.items.len > 0) {
+        try drawCodeBlock(
+            allocator,
+            &page_streams,
+            &current_page,
+            &has_page,
+            &cursor_y,
+            indented_code_block.items,
+            null,
             margin_left,
             margin_top,
             margin_bottom,
@@ -859,6 +924,23 @@ fn leadingIndentColumns(line: []const u8) usize {
         break;
     }
     return cols;
+}
+
+fn skipIndentColumns(line: []const u8, want_cols: usize) usize {
+    var i: usize = 0;
+    var cols: usize = 0;
+    while (i < line.len and cols < want_cols) : (i += 1) {
+        if (line[i] == ' ') {
+            cols += 1;
+            continue;
+        }
+        if (line[i] == '\t') {
+            cols += 4;
+            continue;
+        }
+        break;
+    }
+    return i;
 }
 
 fn tokenizeCodeLine(
@@ -1807,6 +1889,12 @@ test "list continuation detection" {
     try std.testing.expect(isListContinuation("    continuation text", 1));
     try std.testing.expect(!isListContinuation("  too shallow", 1));
     try std.testing.expect(!isListContinuation("    - nested list", 1));
+}
+
+test "skip indent columns" {
+    try std.testing.expectEqual(@as(usize, 4), skipIndentColumns("    code", 4));
+    try std.testing.expectEqual(@as(usize, 1), skipIndentColumns("\tcode", 4));
+    try std.testing.expectEqual(@as(usize, 3), skipIndentColumns("  \tcode", 4));
 }
 
 test "parse blockquote line" {
